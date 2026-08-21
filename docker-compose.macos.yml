@@ -21,5 +21,9 @@ services:
     # here: the `user: "0:0"` above already means SQL runs as root and can
     # write the root-owned tmpfs. !override replaces the list rather than
     # merging into it.
+    # Size is tunable because on a RAM-constrained Mac this tmpfs competes
+    # directly with the NST for the VM's memory — it is guest RAM, not disk.
+    # Default matches the Linux compose file; lower it before lowering the VM
+    # allocation. Pair with MSSQL_MEMORY_LIMIT_MB.
     tmpfs: !override
-      - /var/opt/mssql/data:size=4g
+      - /var/opt/mssql/data:size=${BC_SQL_TMPFS_SIZE:-4g}

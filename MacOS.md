@@ -53,12 +53,29 @@ podman machine stop && podman machine set --memory 15000 && podman machine start
 ```
 
 **Sizing note.** 15000 MB is what BC comfortably wants, but on a 16 GB Mac that
-is 94% of physical RAM and macOS will swap continuously. ~12000 is the practical
-ceiling there, and it is genuinely tight: SQL is capped at 2 GB
-(`MSSQL_MEMORY_LIMIT_MB`), its data tmpfs can grow to another 4 GB *inside* the
-VM's RAM, and the NST wants several GB while compiling AL extensions. If BC gets
-OOM-killed on first boot, shrink the `tmpfs` size in `docker-compose.macos.yml`
-rather than raising the VM allocation further.
+is 94% of physical RAM and macOS will swap continuously.
+
+The VM allocation is not the only knob, and it is the wrong one to reach for
+first. Inside the VM the memory goes to three places:
+
+| consumer | knob | default |
+|---|---|---|
+| SQL Server | `MSSQL_MEMORY_LIMIT_MB` | 2048 |
+| SQL data tmpfs (**guest RAM, not disk**) | `BC_SQL_TMPFS_SIZE` | 4g |
+| the NST — spikes while compiling AL | — | — |
+
+Measured steady state at 12000 MB with the web client running: ~6.5 GB used of
+11.6 GB, of which ~1.2 GB was the database sitting in tmpfs. So a smaller VM is
+viable *if* you shrink the first two first — dropping to 8000 MB without also
+lowering them leaves roughly 1 GB of headroom, and boot (DB restore, extension
+publish, AL compile) is the peak, not the steady state.
+
+The tmpfs one surprises people: it is a RAM disk, so every byte of database
+counts against the VM's memory. Lowering it caps how large the database can
+grow — fine for a demo tenant, not for a restored production-sized one.
+
+If BC gets OOM-killed, shrink `BC_SQL_TMPFS_SIZE` and `MSSQL_MEMORY_LIMIT_MB`
+before raising the VM allocation.
 
 ### 4. Enable Rosetta
 
@@ -315,7 +332,13 @@ substitution leaves `DOCKER_HOST=unix://`, which fails far more confusingly than
 having it unset. The socket path is stable per user, so you can also just
 hardcode it once you know it.
 
-Add `export BC_WEBCLIENT=1` too if you want the web client (see below).
+Add `export BC_WEBCLIENT=1` too if you want the web client (see below), and on
+a RAM-constrained Mac the two memory knobs from step 3:
+
+```
+export BC_SQL_TMPFS_SIZE=2g
+export MSSQL_MEMORY_LIMIT_MB=1536
+```
 
 Then a normal session is:
 
@@ -355,6 +378,10 @@ Shutting down is `./scripts/macos-tunnel.sh --stop`, `docker-compose ... down`,
   survive because they live on the host (see above).
 * **`podman machine set --memory` needs the machine stopped**, and the value is
   RAM taken from macOS — see the sizing note in step 3 before raising it.
+* **The memory knobs are environment variables, so they must be set on every
+  `up` as well** — same trap as `BC_WEBCLIENT`. A forgotten
+  `BC_SQL_TMPFS_SIZE` silently restores the 4 GB default and can OOM a VM you
+  had sized to fit 2 GB.
 * **`BC_WEBCLIENT=1` must be set on every `up`.** It is a compose environment
   variable, so running `up` without it silently recreates the bc container
   *without* the web client — and recreating means another full DB restore. Put

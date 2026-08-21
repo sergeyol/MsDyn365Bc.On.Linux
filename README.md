@@ -289,6 +289,15 @@ Executing 2 codeunits via WebSocket (max 26 iterations)...
 3 total, 3 passed, 0 failed, 0 skipped
 ```
 
+### Wiring this into another repo's agent loop
+
+To give an AL repo a one-command test gate an agent can run after every change —
+build, publish, test, with an exit code that separates "your code is broken"
+from "there is no environment to test against" — see
+[docs/AGENT-TEST-LOOP.md](docs/AGENT-TEST-LOOP.md). It is written to be handed
+to an agent directly: point one at that file and it will add the loop to the
+repo it is working in.
+
 ### JUnit XML output
 
 Pass `--junit-output <path>` to also write per-test results as a JUnit

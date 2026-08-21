@@ -15,3 +15,11 @@ services:
     # Rootful podman mounts the tmpfs at /var/opt/mssql/data owned by root,
     # which the image's non-root mssql user cannot write to.
     user: "0:0"
+    # podman validates tmpfs mount options and rejects uid=/gid= with
+    # `unknown mount option "uid=10001": invalid mount option`, where Docker
+    # accepts them and passes them through to the kernel. Harmless to drop
+    # here: the `user: "0:0"` above already means SQL runs as root and can
+    # write the root-owned tmpfs. !override replaces the list rather than
+    # merging into it.
+    tmpfs: !override
+      - /var/opt/mssql/data:size=4g

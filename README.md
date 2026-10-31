@@ -5,7 +5,7 @@ Docker Compose. No fork — the unmodified Microsoft .NET 8 service tier is
 patched at runtime so it boots and serves on Linux.
 
 ```bash
-git clone https://github.com/StefanMaron/MsDyn365Bc.On.Linux.git
+git clone https://github.com/aldevtools/MsDyn365Bc.On.Linux.git
 cd MsDyn365Bc.On.Linux
 docker compose up -d --wait
 ```
@@ -15,7 +15,7 @@ The `--wait` flag returns once BC is healthy. **First boot takes ~5 minutes**
 starts take ~1 minute.
 
 You don't need to build anything: `docker compose up` **pulls the prebuilt,
-publicly accessible image** (`ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest`)
+publicly accessible image** (`ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest`)
 when it isn't already in your local cache — no GHCR auth required. To grab a
 newer published build later, run `docker compose pull`. Only contributors
 hacking on the image itself need `docker compose build` (an explicit build
@@ -122,13 +122,11 @@ curl -sf -u MYUSER:MyP@ss1! http://localhost:7048/BC/ODataV4/Company
 The scripts in `scripts/` (`run-tests.sh`, `run-tests-altool.py`,
 `run-tests-hybrid.py`, `publish-app.sh`, etc.) pick the same two env vars up
 automatically, so no `--auth` flag is needed once the container was booted
-with them. Password verification is not actually enforced on Linux —
-`NavUser.TryAuthenticate`'s hash check doesn't port from Windows, so
-StartupHook Patch #16b bypasses it and any password authenticates as an
-existing, enabled user. `BC_SERVER_PASSWORD` still works end-to-end (that
-exact value is what you type/pass), it just isn't a real access control —
-this is a local dev/CI sandbox account, not something to expose to an
-untrusted network.
+with them. The entrypoint derives Microsoft's V3 password representation from
+`BC_SERVER_PASSWORD`, and the unmodified Business Central verifier enforces it:
+wrong passwords and disabled, expired, or nonexistent users are rejected.
+These remain local dev/CI credentials; do not expose the container's ports to
+an untrusted network.
 
 ### Web client (browser UI)
 
@@ -255,6 +253,17 @@ When `--app` is provided the script reads `SymbolReference.json` from the
 `--codeunit-range` if also provided. This avoids the SetupSuite call having
 to iterate tens of thousands of nonexistent IDs.
 
+**Long codeunit lists are batched automatically.** The websocket runner sets
+the suite up by POSTing the ids as one string field, `CodeunitIds:
+Text[2048]` on table 99903, so a list past 2048 characters is rejected by BC
+outright — HTTP 400 `Application_StringExceededLength`, before any test runs.
+Roughly 340 five-digit ids is where that lands. `run-tests.sh` splits the
+list, sets the suite up and runs it once per batch, and merges the reports,
+so the JUnit XML and the `N total, P passed, F failed` line are the same as
+an un-batched run's. Set `BC_CODEUNIT_IDS_MAX_CHARS` to change the per-batch
+budget (default 1000). `python3 scripts/test-run-tests-batching.py` exercises
+the whole loop against a fake BC — no container needed.
+
 **Which company tests run in:** by default both runners read the OData
 `Company` page and pick the evaluation (demo) company. That works on any
 localization without knowing the name in advance — the CRONUS company is
@@ -347,19 +356,23 @@ BC_DEV_PORT=17049 docker compose up -d
 | `BC_TYPE`         | `sandbox`        | `sandbox` or `onprem`                                                        |
 | `SA_PASSWORD`     | `Passw0rd123!`   | SQL Server SA password                                                       |
 | `SQL_PORT`        | `11433`          | Host port for SQL Server                                                     |
+| `BC_DATABASE`     | `CRONUS`         | SQL database name. Set one per instance so several BC versions can share one SQL Server. `scripts/snapshot.sh` reads it from its own environment, so export it there too. |
 | `BC_DEV_PORT`     | `7049`           | Dev endpoint port (publish, symbols)                                         |
 | `BC_ODATA_PORT`   | `7048`           | OData v4 port                                                                |
 | `BC_API_PORT`     | `7052`           | API v2.0 port                                                                |
 | `BC_MGMT_PORT`    | `7045`           | Management endpoint port                                                     |
 | `BC_CLIENT_PORT`  | `7085`           | WebSocket client services port (used by `run-tests.sh`)                      |
+| `BC_SERVER_USERNAME` | `BCRUNNER`    | NavUserPassword service user created with SUPER access                       |
+| `BC_SERVER_PASSWORD` | `Admin123!`   | Enforced password used to generate the service user's Microsoft V3 value     |
 | `BC_LICENSE_HOST_PATH` | unset       | Optional host path to a `.bclicense` file. Mounted into bc + sql containers and imported INSTEAD of the default Cronus license. See "Custom license" below. |
 | `BC_LICENSE_FILE` | unset            | Path INSIDE the container of the license file to import. Set to `/bc/custom-license.bclicense` together with `BC_LICENSE_HOST_PATH`. |
 | `BC_SQL_IMAGE`    | GHCR mirror      | SQL Server image. See "SQL Server image" below.                              |
 | `BC_DL_STREAMS`   | `16`             | Parallel byte-range streams per artifact zip (32 total across the two).       |
 | `BC_DL_BIG_SHARE` | `70`             | Percent of the stream budget given to the larger zip so it lands first and its extraction overlaps the other download. `50` restores an even split. |
+| `BC_CODEUNIT_IDS_MAX_CHARS` | `1000` | Characters of codeunit ids `run-tests.sh` sends per suite-setup request. BC's `CodeunitIds` field is `Text[2048]`; the default leaves room for the test suite to grow. |
 
 **SQL Server image:** the `sql` service defaults to
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022-zstd`, a mirror of
+`ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022-zstd`, a mirror of
 `mcr.microsoft.com/mssql/server:2022-latest` with the layers recompressed
 to zstd, refreshed weekly by `.github/workflows/mirror-sql-image.yml`.
 
@@ -375,7 +388,7 @@ can't handle zstd layers. Point `BC_SQL_IMAGE` anywhere you like:
 
 ```bash
 # gzip fallback
-BC_SQL_IMAGE=ghcr.io/stefanmaron/msdyn365bc.on.linux/mssql:2022 docker compose up -d
+BC_SQL_IMAGE=ghcr.io/aldevtools/msdyn365bc.on.linux/mssql:2022 docker compose up -d
 
 # straight from Microsoft
 BC_SQL_IMAGE=mcr.microsoft.com/mssql/server:2022-latest docker compose up -d
@@ -421,7 +434,7 @@ patched DLLs).
 
 bc-linux ships starter CI/CD templates so downstream projects can run AL
 tests against a Linux BC without forking or copy-pasting hundreds of lines
-of YAML. The image at `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest`
+of YAML. The image at `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest`
 is publicly accessible — no GHCR auth needed.
 
 | Path                                         | What it is                                                                |
@@ -438,7 +451,7 @@ name: BC Tests
 on: [push, pull_request, workflow_dispatch]
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       bc_version:     "27.5"
       app_dirs:       "app"
@@ -458,7 +471,7 @@ This repository includes a devcontainer at `.devcontainer/devcontainer.json`.
 Open it in a Codespace and BC starts automatically via Docker-in-Docker.
 The AL Language extension is pre-installed.
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/StefanMaron/MsDyn365Bc.On.Linux)
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/aldevtools/MsDyn365Bc.On.Linux)
 
 ---
 
@@ -525,7 +538,7 @@ derives the project name from the working directory's basename, which is
 `docker compose down --remove-orphans` deletes the first job's BC in the
 middle of its test run, and both die with GitHub's generic "the runner has
 received a shutdown signal" — which points nowhere near the cause
-([issue #24](https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/24)).
+([issue #24](https://github.com/aldevtools/MsDyn365Bc.On.Linux/issues/24)).
 
 Every pipeline in this repo therefore takes a machine-wide lease
 (`scripts/ci-lock.sh`) around the container lifecycle, so jobs sharing a
@@ -538,7 +551,7 @@ once on one self-hosted machine, give each caller its own slot:
 ```yaml
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       instance_slot: 1     # project bc-linux-1; every port +100
 ```
@@ -590,5 +603,5 @@ versions. Trigger it manually with custom versions:
 versions: "27.0,27.5,28.0"
 ```
 
-The published image is `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner`
+The published image is `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner`
 (public). The `:latest` tag tracks `master`.

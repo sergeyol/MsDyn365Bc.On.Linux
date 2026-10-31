@@ -2,7 +2,7 @@
 
 Run AL tests against a Business Central NST on Linux from your own GitHub
 repo. All flavours pull the public
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner` image (no auth needed)
+`ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner` image (no auth needed)
 and use the bc-linux scripts to boot BC, publish your apps, and execute
 tests via the bundled TestRunnerExtension.
 
@@ -17,7 +17,7 @@ name: BC Tests
 on: [push, pull_request, workflow_dispatch]
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       bc_version:     "27.5"
       app_dirs:       "app"
@@ -46,11 +46,13 @@ reproducible CI runs swap it for a release tag once one exists
 | `bc_version` | no | `27.5` | BC platform version |
 | `bc_country` | no | `w1` | BC country code |
 | `bc_type` | no | `sandbox` | `sandbox` or `onprem` |
-| `app_dirs` | no | `""` | Space-separated dirs containing `app.json` for production apps |
-| `test_app_dirs` | **yes** | — | Space-separated dirs containing `app.json` for test apps |
+| `app_dirs` | no | `""` | Newline-separated dirs containing `app.json` for production apps (a dir name can itself contain a space) |
+| `test_app_dirs` | **yes** | — | Newline-separated dirs containing `app.json` for test apps (a dir name can itself contain a space) |
 | `codeunit_range` | **yes** | — | IDs of your **test** codeunits to execute. Production app codeunits are published but not run. Accepts `"50000..99999"` (single AL range), `"50000..50100\|130450..130459"` (multiple ranges, pipe-separated), `"50000,50001,50002"` (explicit ids), or any mix. |
 | `al_tool_version` | no | *(auto-derived from bc_version)* | Linux AL compiler NuGet version. Auto-derived: BC 27 → `16.2.28.57946`, BC 28 → `17.0.34.45391`. Set explicitly to pin. |
 | `preprocessor_symbols` | no | `""` | Comma-separated preprocessor symbols for `/preprocessorsymbols` (e.g. `"BC27PLUS,BC28PLUS"`). |
+| `extra_apps` | no | `""` | Newline-separated names of Microsoft apps from the BC artifact to keep installed with their dependencies, although none of your apps declares them, e.g. `Tests-TestLibraries` and `Data Archive`, which a Windows container has installed. A name that matches no app fails the job. Each app not already installed costs a publish at boot (Tests-TestLibraries: about 17s). Also on `bc-test-prebuilt.yml`. |
+| `assembly_probing_paths` | no | `""` | Newline-separated folders passed to the compiler as `/assemblyprobingpaths`, for OnPrem apps that declare DotNet assemblies from the BC artifact. Relative entries resolve against the job's artifact folder and may use globs, e.g. `platform/Test Assemblies` (Newtonsoft.Json) and `platform/ServiceTier/PFiles64/Microsoft Dynamics NAV/*/Service` (NavUserAccount, Timer, NavEtwReceiver, ClientExtensions). Subfolders are searched too. |
 | `runtime_version` | no | `""` (no rewrite) | Opt-in rewrite of `app.json` `runtime` before compile. Blank (default): your declared runtime is respected as-is. `auto`: derive from bc_version (BC 27 → `16.0`, BC 28 → `17.0`). Explicit value: patch to exactly that. |
 | `runner_image` | no | public ghcr.io tag | Override the bc-runner image |
 | `bc_linux_ref` | no | `master` | Git ref of `MsDyn365Bc.On.Linux` to check out for scripts |
@@ -87,7 +89,7 @@ Then call the reusable workflow with:
 ```yaml
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       ...
     secrets:
@@ -126,8 +128,8 @@ All flavours:
 2. **Edit the `env:` block** at the top:
    - `BC_VERSION`, `BC_COUNTRY`, `BC_TYPE` — which Microsoft BC build to test
      against. Defaults: `27.5` / `w1` / `sandbox`.
-   - **From-source**: `APP_DIRS` and `TEST_APP_DIRS` — space-separated paths
-     to directories containing `app.json`.
+   - **From-source**: `APP_DIRS` and `TEST_APP_DIRS` — newline-separated paths
+     to directories containing `app.json` (a dir name can itself contain a space).
    - **Pre-built**: `APP_FILES` and `TEST_APP_FILES` — space-separated paths
      to `.app` files in your repo.
    - `CODEUNIT_RANGE` — IDs of your test codeunits. Accepts `70000..70099`
@@ -138,7 +140,7 @@ All flavours:
 
 ## What's running under the hood
 
-- **Image**: `ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest` — multi-stage Docker
+- **Image**: `ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner:latest` — multi-stage Docker
   image that downloads Microsoft BC artifacts at boot, copies the .NET 8
   service tier into place, applies a startup-hook patch set, restores the
   CRONUS demo DB, and exposes BC on the standard 7045–7089 ports.
@@ -173,7 +175,7 @@ A worked example using the reusable flavour:
 ```yaml
 jobs:
   bc-tests:
-    uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+    uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
     with:
       bc_version:     "27.5"
       app_dirs:       "app"
@@ -220,7 +222,7 @@ that hides the real cause, `ALCops.Common.dll` co-load) live in
 ## Reporting issues
 
 If a workflow fails on the bc-linux side (not your AL code), open an issue
-at <https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues> with:
+at <https://github.com/aldevtools/MsDyn365Bc.On.Linux/issues> with:
 
 - Your `env:` block
 - The BC version you targeted

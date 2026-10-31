@@ -42,3 +42,9 @@ services:
       # DatabaseServer setting expect. Writing it this way means snapshot mode
       # does not also require the caller to move SQL_PORT to 1433.
       SQL_SERVER: localhost,${SQL_PORT:-11433}
+      # The web client (BC_WEBCLIENT=1) watches its wwwroot with inotify, and
+      # criu cannot dump an inotify watch whose handle it cannot reopen:
+      #   fsnotify: Handle 0x58:0x2a9468 cannot be opened / Can't dump that handle
+      # (the watched path was /bc/webclient/wwwroot/Reports\). Polling instead of
+      # inotify removes the watch, so create works with the web client on.
+      DOTNET_USE_POLLING_FILE_WATCHER: "1"

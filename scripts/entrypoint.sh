@@ -36,6 +36,11 @@ BC_VERSION="${BC_VERSION:-27.5.46862.48004}"
 BC_COUNTRY="${BC_COUNTRY:-w1}"
 SA_PASSWORD="${SA_PASSWORD:-Passw0rd123!}"
 BC_DB_PASSWORD="${BC_DB_PASSWORD:-Test1234}"
+# Database name. Defaults to CRONUS so existing setups are unchanged. Set it
+# per instance so several BC versions can share one SQL Server without the
+# next one attaching to the previous one's schema and dying with
+# "must be converted".
+BC_DATABASE="${BC_DATABASE:-CRONUS}"
 BC_DB_USER="${BC_DB_USER:-bctest}"
 SQL_SERVER="${SQL_SERVER:-sql}"
 ARTIFACTS="/bc/artifacts"
@@ -174,8 +179,8 @@ log_step "Disk: $(df -h /bc/artifacts | tail -1 | awk '{print $4 " free"}')"
 log_step "Reading manifest..."
 MANIFEST="$ARTIFACTS/app/manifest.json"
 ls -la "$MANIFEST" || { log_step "FATAL: manifest.json not found at $MANIFEST"; exit 1; }
-DB_FILE=$(python3 -c "import json; print(json.load(open('$MANIFEST')).get('database',''))")
-LICENSE_FILE=$(python3 -c "import json; print(json.load(open('$MANIFEST')).get('licenseFile',''))")
+DB_FILE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("database", "").replace("\\", "/"))' "$MANIFEST")
+LICENSE_FILE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("licenseFile", "").replace("\\", "/"))' "$MANIFEST")
 PLATFORM_VERSION=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['platform'])")
 MAJOR_VERSION=$(echo "$PLATFORM_VERSION" | cut -d. -f1)
 NAV_DIR="${MAJOR_VERSION}0"
@@ -208,7 +213,12 @@ STEP2_START=$(date +%s)
 # copy it to. Everything else Step 2 writes is a constant.
 SERVICE_STAMP_FILE="$SERVICE_DIR/.bc-service-stamp"
 SERVICE_CONFIG_FP=$(printf '%s|%s|%s' "$SQL_SERVER" "$BC_DB_USER" "$BC_DB_PASSWORD" | md5sum | cut -c1-12)
-SERVICE_STAMP="v1|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|config=$SERVICE_CONFIG_FP"
+# The fourth is the binary patcher plus the switch that turns its text patches on. The hook
+# alone is not enough: a change to PatchNclTestPage (or BC_WINDOWS_TEXT) rewrites the
+# service DLLs but leaves StartupHook.dll untouched, so a warm volume kept the DLLs the
+# previous patcher produced and the new patch never ran.
+SERVICE_PATCHER_FP="$(stat -c '%s-%Y' /bc/tools/patcher/PatchNclTestPage.dll 2>/dev/null || echo none)-text${BC_WINDOWS_TEXT:-1}"
+SERVICE_STAMP="v2|platform=$PLATFORM_VERSION|image=$(stat -c '%s-%Y' /bc/hook/StartupHook.dll 2>/dev/null || echo unknown)|patcher=$SERVICE_PATCHER_FP|config=$SERVICE_CONFIG_FP"
 if [ -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ] && \
    [ "$(cat "$SERVICE_STAMP_FILE" 2>/dev/null || true)" != "$SERVICE_STAMP" ]; then
     log_step "Service tier in the volume was built by a different platform/image — rebuilding it"
@@ -251,6 +261,11 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
     mkdir -p "/usr/share/Microsoft/Microsoft Dynamics NAV/$NAV_DIR/Server"
 
     # Patch CustomSettings.config
+    # ManagementApiServicesEnabled is forced off too: on Linux its AspNetCoreApiHost
+    # calls File.Delete on a Unix socket path whose parent directory does not exist,
+    # which throws DirectoryNotFoundException rather than being ignored, and the NST
+    # reports "The service MicrosoftDynamicsNavServer failed to start". Observed on
+    # BC 30. Nothing this image needs uses the Admin API.
     # ManagementServicesEnabled is forced off: with it on, NST crashes at startup
     # (Microsoft.IdentityModel.S2S.Configuration.ConfigurationException: S2S40011 -
     # "At least one inbound policy should be provided") because the Admin API's AAD
@@ -259,7 +274,7 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
     CONFIG="$SERVICE_DIR/CustomSettings.config"
     sed -i \
         -e "s|DatabaseServer\" value=\"[^\"]*\"|DatabaseServer\" value=\"$SQL_SERVER\"|" \
-        -e "s|DatabaseName\" value=\"[^\"]*\"|DatabaseName\" value=\"CRONUS\"|" \
+        -e "s|DatabaseName\" value=\"[^\"]*\"|DatabaseName\" value=\"$BC_DATABASE\"|" \
         -e "s|DatabaseUserName\" value=\"[^\"]*\"|DatabaseUserName\" value=\"$BC_DB_USER\"|" \
         -e "s|ProtectedDatabasePassword\" value=\"[^\"]*\"|ProtectedDatabasePassword\" value=\"$BC_DB_PASSWORD\"|" \
         -e "s|ClientServicesCredentialType\" value=\"[^\"]*\"|ClientServicesCredentialType\" value=\"NavUserPassword\"|" \
@@ -272,6 +287,7 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
         -e "s|ManagementServicesPort\" value=\"[^\"]*\"|ManagementServicesPort\" value=\"7045\"|" \
         -e "s|ManagementApiServicesPort\" value=\"[^\"]*\"|ManagementApiServicesPort\" value=\"7086\"|" \
         -e "s|ManagementServicesEnabled\" value=\"[^\"]*\"|ManagementServicesEnabled\" value=\"false\"|" \
+        -e "s|ManagementApiServicesEnabled\" value=\"[^\"]*\"|ManagementApiServicesEnabled\" value=\"false\"|" \
         -e "s|DeveloperServicesPort\" value=\"[^\"]*\"|DeveloperServicesPort\" value=\"7049\"|" \
         -e "s|ServerInstance\" value=\"[^\"]*\"|ServerInstance\" value=\"BC\"|" \
         -e "s|ExtensionAllowedTargetLevel\" value=\"[^\"]*\"|ExtensionAllowedTargetLevel\" value=\"OnPrem\"|" \
@@ -287,9 +303,47 @@ if [ ! -f "$SERVICE_DIR/Microsoft.Dynamics.Nav.Server.dll" ]; then
         sed -i '/<\/appSettings>/i\  <add key="TestAutomationEnabled" value="true"/>' "$CONFIG"
     fi
 
+    # SignalR hub errors: report the real exception, not "An unexpected error
+    # occurred invoking 'X' on the server."
+    #
+    # Both /dev hubs (DebuggerHub and TestRunnerHub) are registered through one
+    # services.AddSignalR(o => o.EnableDetailedErrors =
+    # ServerUserSettings.Instance.DebuggerSignalREnableDetailedErrors), and that
+    # setting defaults to false. TestRunnerHub.Initialize catches only
+    # TestRunnerException, so anything else out of TestRunnerRuntime
+    # .InitializeRuntime (CreateConnectionAndSession -> EnsureSessionOpened ->
+    # OpenCompanyAsync) leaves the server as SignalR's generic placeholder and
+    # `al runtests` prints "An unexpected error occurred invoking 'Initialize'
+    # on the server." with no type, no message and no stack. That is what four
+    # intermittent CI aborts have produced so far, and none of them could be
+    # diagnosed from the log.
+    #
+    # This is a throwaway dev/CI container reached only over localhost, so
+    # there is nothing to leak to. Declared internal-use-only by BC but
+    # EmitSetting.Allow, i.e. readable from CustomSettings.config like
+    # DefaultLanguage and the other internal settings this image already relies on.
+    if grep -q "DebuggerSignalREnableDetailedErrors" "$CONFIG"; then
+        sed -i 's|DebuggerSignalREnableDetailedErrors" value="[^"]*"|DebuggerSignalREnableDetailedErrors" value="true"|' "$CONFIG"
+    else
+        sed -i '/<\/appSettings>/i\  <add key="DebuggerSignalREnableDetailedErrors" value="true" />' "$CONFIG"
+    fi
+
     log_step "Service tier configured."
 else
     log_step "Service tier already set up."
+fi
+
+# Reconcile the database name on every boot, not only on first setup. The block
+# above runs once per service tier, so without this an existing instance keeps
+# whichever database it was first configured with and changing BC_DATABASE
+# silently does nothing.
+NST_CONFIG="$SERVICE_DIR/CustomSettings.config"
+if [ -f "$NST_CONFIG" ]; then
+    CURRENT_DB=$(grep -o 'DatabaseName" value="[^"]*"' "$NST_CONFIG" | sed 's/.*value="\(.*\)"/\1/')
+    if [ -n "$CURRENT_DB" ] && [ "$CURRENT_DB" != "$BC_DATABASE" ]; then
+        log_step "Repointing service tier from database '$CURRENT_DB' to '$BC_DATABASE'"
+        sed -i "s|DatabaseName\" value=\"[^\"]*\"|DatabaseName\" value=\"$BC_DATABASE\"|" "$NST_CONFIG"
+    fi
 fi
 
 # Copy WebClient DLLs needed for TestPage (page testability in tests).
@@ -436,19 +490,113 @@ if [ -f /bc/patched/Mono.Cecil.dll ]; then
     log_step "Applied patched Mono.Cecil.dll (CheckFileName empty path fix)"
 fi
 
-# Patch TestPage support: fix assembly loading and async deadlock
+# Patch TestPage support: fix assembly loading (and, opt-in only, force the
+# communication channels synchronous).
 # Nav.Ncl.dll: Assembly.Load (version-qualified) → Assembly.LoadFrom (file path)
-# TestPageClient.dll: CommunicationBroker Async=true → false (prevents dispatcher deadlock)
+# Nav.Types.dll: TestClientProxy Assembly.Load (version-qualified) → LoadFrom
 if [ -f /bc/tools/patcher/PatchNclTestPage.dll ]; then
     PATCHER="dotnet /bc/tools/patcher/PatchNclTestPage.dll"
     if $PATCHER ncl "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>&1 | tail -1; then
         log_step "Patched Nav.Ncl.dll (TestPage Assembly.Load → LoadFrom)"
     fi
-    if $PATCHER client "$SERVICE_DIR/Microsoft.Dynamics.Nav.Client.TestPageClient.dll" 2>&1 | tail -1; then
-        log_step "Patched TestPageClient.dll (Async=true → false)"
+    # TestPageClient.dll: CommunicationBroker Async=true → false.
+    #
+    # Default is OFF (leave Async=true, matching a real BC tier). issue #78 traced why this
+    # matters beyond "correct in principle": Async=true is what makes BC coalesce rapid-fire
+    # PropertyChanged/CurrentRowChanged notifications during a page/part fill — the queue in
+    # CommunicationChannel evicts messages past ChannelOptions.QueueLength
+    # (EnsureQueueLength), and BindingManagerConsumerPort.FillStarting only pulls one survivor
+    # per channel per fill. With Async=false every notification is sent inline instead, so an
+    # empty linked part's draft row got notified via OnNewRecord twice as often here as on a
+    # real Windows sandbox tier (6 vs 3, exact ratio, confirmed against an online sandbox) —
+    # not a viewport-rendering difference, the SAME single draft row re-fired extra times.
+    #
+    # The deadlock this patch was written against (commit 29d2bdf) was never isolated from
+    # that commit's OTHER fix in the same change (ToUnicodeEx returning 0 instead of 1, which
+    # on its own caused an infinite loop in KeyboardMapper.ClearKeyboardBuffer during page form
+    # building) — and at the time TestPage couldn't run end-to-end anyway
+    # (NavSession.CreateNavTestService() still threw NotSupportedException). Re-tested against
+    # a RunObject → StandardDialog target answered by [ModalPageHandler] (the shape most likely
+    # to need a real pump) with Async left at true: 7/7 pass, no hang.
+    #
+    # BC_TESTPAGE_ASYNC_PATCH=1 restores the old forced-synchronous behavior, in case a TestPage
+    # scenario this hasn't been exercised against does need the pump that doesn't exist here.
+    if [ "${BC_TESTPAGE_ASYNC_PATCH:-0}" = "1" ]; then
+        if $PATCHER client "$SERVICE_DIR/Microsoft.Dynamics.Nav.Client.TestPageClient.dll" 2>&1 | tail -1; then
+            log_step "Patched TestPageClient.dll (Async=true → false, BC_TESTPAGE_ASYNC_PATCH=1)"
+        fi
     fi
     if $PATCHER types "$SERVICE_DIR/Microsoft.Dynamics.Nav.Types.dll" 2>&1 | tail -1; then
         log_step "Patched Nav.Types.dll (TestClientProxy Assembly.Load → LoadFrom)"
+    fi
+    # TemporaryPath() is "<user folder>/TEMP\" and stays that way, as on Windows. Linux System.IO
+    # does not read "\" as a separator, so DotNet calls get the path with "/" and MediaSet
+    # takes its file name at either separator (issues #175, #176, #181). A failure here means a
+    # BC update moved the code; stop the boot instead of running without the fix.
+    TEMP_PATCH_OUT=$($PATCHER temppath "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>&1) && TEMP_PATCH_RC=0 || TEMP_PATCH_RC=$?
+    echo "$TEMP_PATCH_OUT" | tail -2
+    if [ "$TEMP_PATCH_RC" != "0" ]; then
+        log_step "ERROR: temp path patch for Nav.Ncl.dll failed (exit $TEMP_PATCH_RC)"
+        exit 1
+    fi
+    log_step "Patched Nav.Ncl.dll (DotNet path arguments and MediaSet file name under the user folder)"
+    # DotNet directory listings: case-insensitive patterns and name order, as on NTFS (issue #183).
+    # Same rule as above: a failure means BC moved the code, so stop instead of running without it.
+    LISTING_PATCH_OUT=$($PATCHER filelisting "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>&1) && LISTING_PATCH_RC=0 || LISTING_PATCH_RC=$?
+    echo "$LISTING_PATCH_OUT" | tail -2
+    if [ "$LISTING_PATCH_RC" != "0" ]; then
+        log_step "ERROR: file listing patch for Nav.Ncl.dll failed (exit $LISTING_PATCH_RC)"
+        exit 1
+    fi
+    log_step "Patched Nav.Ncl.dll (DotNet directory listings match case-insensitively and sort by name)"
+    # File virtual table: its Path field is Code, so BC upper-cases '/tmp/' to '/TMP/'. NTFS
+    # ignores case; here the folder is found ignoring case too (issue #199). Same failure rule.
+    FILETABLE_PATCH_OUT=$($PATCHER filetable "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>&1) && FILETABLE_PATCH_RC=0 || FILETABLE_PATCH_RC=$?
+    echo "$FILETABLE_PATCH_OUT" | tail -2
+    if [ "$FILETABLE_PATCH_RC" != "0" ]; then
+        log_step "ERROR: File table patch for Nav.Ncl.dll failed (exit $FILETABLE_PATCH_RC)"
+        exit 1
+    fi
+    log_step "Patched Nav.Ncl.dll (File table finds its folder ignoring case)"
+    # [HttpClientHandler] in a test codeunit: BC only calls the handler when the topology says
+    # "local environment", and Patch #9's topology says no (issue #192). This one read answers
+    # yes, as StandardServiceTopology does on Windows. Same failure rule as above.
+    HTTP_PATCH_OUT=$($PATCHER testhttphandler "$SERVICE_DIR/Microsoft.Dynamics.Nav.Ncl.dll" 2>&1) && HTTP_PATCH_RC=0 || HTTP_PATCH_RC=$?
+    echo "$HTTP_PATCH_OUT" | tail -2
+    if [ "$HTTP_PATCH_RC" != "0" ]; then
+        log_step "ERROR: test HTTP handler patch for Nav.Ncl.dll failed (exit $HTTP_PATCH_RC)"
+        exit 1
+    fi
+    log_step "Patched Nav.Ncl.dll (test codeunits call their HttpClientHandler)"
+    # Windows Language table: ICU lists zh-TW, zh-HK, zh-SG and zh-MO only under script names
+    # (zh-Hant-TW, ...), so BC dropped them (issue #198). Same failure rule as above.
+    LANG_PATCH_OUT=$($PATCHER windowslanguages "$SERVICE_DIR/Microsoft.Dynamics.Nav.Types.dll" 2>&1) && LANG_PATCH_RC=0 || LANG_PATCH_RC=$?
+    echo "$LANG_PATCH_OUT" | tail -2
+    if [ "$LANG_PATCH_RC" != "0" ]; then
+        log_step "ERROR: Windows Language patch for Nav.Types.dll failed (exit $LANG_PATCH_RC)"
+        exit 1
+    fi
+    log_step "Patched Nav.Types.dll (Windows Language table lists the Chinese regional cultures)"
+    # Text behaviour a Windows tier has and Linux does not (issue #113). Both are constants
+    # inside CoreLib's precompiled code, so no runtime hook can reach them; BC's own call
+    # sites are rewritten in the IL instead.
+    #   newline:  Environment.NewLine is CRLF (error texts, TextBuilder, XML, ...)
+    #   encoding: Encoding.GetEncoding(0), the ANSI code page, is windows-1252, not UTF-8
+    #   uri:      new Uri("/path") is a file URI here and an error on Windows (HTTP objects only)
+    #   culture:  ICU's narrow no-break space before AM/PM in time patterns is a plain space
+    # BC_WINDOWS_TEXT=0 leaves the assemblies as Microsoft shipped them.
+    if [ "${BC_WINDOWS_TEXT:-1}" = "1" ]; then
+        for TXT_ASM in Microsoft.Dynamics.Nav.Ncl Microsoft.Dynamics.Nav.Types; do
+            for TXT_PATCH in newline encoding uri culture; do
+                if $PATCHER $TXT_PATCH "$SERVICE_DIR/$TXT_ASM.dll" 2>&1 | tail -1; then
+                    log_step "Patched $TXT_ASM.dll ($TXT_PATCH, Windows text behaviour)"
+                fi
+            done
+        done
+        # JsonObject.WriteToYaml: YamlDotNet takes its line break from Environment.NewLine too.
+        if [ -f "$SERVICE_DIR/YamlDotNet.dll" ] && $PATCHER newline "$SERVICE_DIR/YamlDotNet.dll" 2>&1 | tail -1; then
+            log_step "Patched YamlDotNet.dll (newline, Windows text behaviour)"
+        fi
     fi
 fi
 
@@ -542,6 +690,114 @@ log_step "Step 2b (patched assemblies): $(($(date +%s) - STEP2B_START))s"
 
 
 # =============================================================================
+# Step 2c: Mono RDLC renderer (opt-in, issue #73)
+# =============================================================================
+# BC renders RDLC in a separate .NET Framework process because the ReportViewer
+# assemblies are net4.6 and the NST is .NET 8 — see docs/RDLC-ON-LINUX.md. That
+# process is a Windows PE, so this image normally replaces it with a sleep stub
+# and no-ops the client (Patches #18/#19/#20).
+#
+# With BC_RDLC_RENDERER=mono we instead run Microsoft's real reporting service
+# under Mono, having replaced its Windows-only text and font stack with our
+# Pango/HarfBuzz/FreeType bridge. Everything here is idempotent and re-run on
+# every boot: the setting is not part of the service-dir stamp, so toggling it
+# has to take effect on a plain restart.
+#
+# Anything unexpected DISABLES the renderer and leaves the tier exactly as it
+# would have been. This is an opt-in feature; it must not be able to fail a boot.
+RDLC_ENABLED=0
+if [ "${BC_RDLC_RENDERER:-}" = "mono" ]; then
+    STEP2C_START=$(date +%s)
+    SIDE_DIR="$SERVICE_DIR/SideServices"
+    rdlc_disable() {
+        echo "[entrypoint] RDLC: $1" >&2
+        echo "[entrypoint] RDLC: renderer disabled; reporting behaves as it does without BC_RDLC_RENDERER" >&2
+        RDLC_ENABLED=0
+    }
+    if [ ! -f /bc/rdlc/librdlc_native.so ]; then
+        rdlc_disable "this image was built without the renderer (rebuild with --build-arg BC_WITH_RDLC=1)"
+    elif ! command -v mono >/dev/null 2>&1; then
+        rdlc_disable "mono is not installed in this image"
+    elif [ ! -f "$SIDE_DIR/Microsoft.ReportViewer.Common.dll" ]; then
+        rdlc_disable "no ReportViewer assemblies in $SIDE_DIR"
+    else
+        # Keep pristine copies. Re-patching must always start from Microsoft's
+        # originals — patching an already-patched assembly is not idempotent.
+        for asm in Microsoft.ReportViewer.Common.dll Microsoft.ReportViewer.DataVisualization.dll \
+                   Microsoft.BusinessCentral.Reporting.Server.dll \
+                   Microsoft.BusinessCentral.Telemetry.OpenTelemetry.dll; do
+            [ -f "$SIDE_DIR/$asm.rdlc-orig" ] || cp "$SIDE_DIR/$asm" "$SIDE_DIR/$asm.rdlc-orig"
+        done
+
+        # The ReportViewer patches are keyed to specific assembly MVIDs, so an
+        # unrecognised BC build is refused rather than half-patched.
+        RDLC_LOG=/tmp/rdlc-patch.log
+        if /bc/rdlc/PatchRdlc/PatchRdlc \
+                "$SIDE_DIR/Microsoft.ReportViewer.Common.dll.rdlc-orig" \
+                "$SIDE_DIR/Microsoft.ReportViewer.Common.dll" \
+                /bc/rdlc/RdlcNativeBridge.dll /usr/lib/mono/4.5 \
+                060066D0,060066B9,06006855,0600685B,06006A31,06006A64,06006A65,06006A66,06006875,0600687B \
+                > "$RDLC_LOG" 2>&1 \
+           && /bc/rdlc/PatchRdlc/PatchRdlc \
+                "$SIDE_DIR/Microsoft.ReportViewer.DataVisualization.dll.rdlc-orig" \
+                "$SIDE_DIR/Microsoft.ReportViewer.DataVisualization.dll" \
+                /bc/rdlc/RdlcNativeBridge.dll /usr/lib/mono/4.5 \
+                >> "$RDLC_LOG" 2>&1; then
+            # Mono compatibility for the service itself: Windows ETW exporters,
+            # printer-dependent PageSettings getters, AppDomain counters Mono
+            # lacks, and CultureInfo rehydration across the reporting AppDomain.
+            # Run FROM the side-service directory: Cecil's resolver searches the
+            # working directory, and writing these assemblies needs to resolve
+            # their siblings (Telemetry.Abstractions among them). Mono still
+            # finds the patcher's own dependencies via its app base in /bc/rdlc.
+            if (cd "$SIDE_DIR" && mono /bc/rdlc/PatchServiceCompat.exe \
+                    Microsoft.BusinessCentral.Telemetry.OpenTelemetry.dll.rdlc-orig \
+                    Microsoft.BusinessCentral.Telemetry.OpenTelemetry.dll \
+                    Microsoft.BusinessCentral.Reporting.Server.dll.rdlc-orig \
+                    Microsoft.BusinessCentral.Reporting.Server.dll \
+                    >> "$RDLC_LOG" 2>&1); then
+                # HeadlessPageSettings.dll is not optional: the patched
+                # Reporting.Server.dll holds real calls into it. Neither is
+                # System.IO.Packaging.dll: the patched ReportViewer takes its
+                # Packaging types from it (Word and Excel output, issue #144).
+                cp /bc/rdlc/RdlcNativeBridge.dll /bc/rdlc/librdlc_native.so \
+                   /bc/rdlc/System.IO.Packaging.dll \
+                   /bc/rdlc/Microsoft.VisualBasic.dll /bc/rdlc/HeadlessPageSettings.dll \
+                   /bc/rdlc/libBCRdlc.IcuBridge.so /bc/rdlc/libSystem.Globalization.Native.so \
+                   "$SIDE_DIR/"
+                # The artifact ships only the Windows gRPC native. BOTH processes
+                # need the Linux one: the reporting service is the gRPC server,
+                # and the NST is the client — Grpc.Core looks for it next to the
+                # base directory of whichever process loaded it.
+                cp /bc/rdlc/libgrpc_csharp_ext.x64.so "$SIDE_DIR/"
+                cp /bc/rdlc/libgrpc_csharp_ext.x64.so "$SERVICE_DIR/"
+                RDLC_ENABLED=1
+                log_step "Step 2c (RDLC renderer staged): $(($(date +%s) - STEP2C_START))s"
+            else
+                rdlc_disable "the side-service compatibility patch failed (see $RDLC_LOG)"
+            fi
+        else
+            rdlc_disable "ReportViewer in this BC build is not one this renderer knows (see $RDLC_LOG)"
+        fi
+        # CI jobs do not keep /tmp, so a refusal that only names the log file
+        # cannot be diagnosed from the job output (issue #143). Print its end.
+        if [ "$RDLC_ENABLED" = "0" ] && [ -s "$RDLC_LOG" ]; then
+            tail -n 30 "$RDLC_LOG" | sed 's/^/[entrypoint] RDLC patch log: /' >&2
+        fi
+        # A refused patch must not leave a partly-written assembly behind.
+        if [ "$RDLC_ENABLED" = "0" ]; then
+            for asm in Microsoft.ReportViewer.Common.dll Microsoft.ReportViewer.DataVisualization.dll \
+                       Microsoft.BusinessCentral.Reporting.Server.dll \
+                       Microsoft.BusinessCentral.Telemetry.OpenTelemetry.dll; do
+                [ -f "$SIDE_DIR/$asm.rdlc-orig" ] && cp "$SIDE_DIR/$asm.rdlc-orig" "$SIDE_DIR/$asm"
+            done
+        fi
+    fi
+fi
+export BC_RDLC_ACTIVE=$RDLC_ENABLED
+
+
+# =============================================================================
 # Step 3: Wait for SQL Server and set up database
 # =============================================================================
 export PATH="$PATH:/opt/mssql-tools18/bin"
@@ -575,9 +831,9 @@ ALTER SERVER ROLE sysadmin ADD MEMBER [$BC_DB_USER];
 "
 
 # Restore database if needed
-DB_EXISTS=$($SQLCMD -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name='CRONUS'" 2>/dev/null | tr -d '[:space:]')
+DB_EXISTS=$($SQLCMD -h -1 -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name='$BC_DATABASE'" 2>/dev/null | tr -d '[:space:]')
 if [ "$DB_EXISTS" != "1" ]; then
-    log_step "Restoring CRONUS database..."
+    log_step "Restoring $BC_DATABASE database..."
     BAK_PATH="$ARTIFACTS/app/$DB_FILE"
     if [ ! -f "$BAK_PATH" ]; then
         log_step "ERROR: Database backup not found at $BAK_PATH"
@@ -591,16 +847,16 @@ if [ "$DB_EXISTS" != "1" ]; then
     log_step "DB logical names: data='$DATA_NAME' log='$LOG_NAME'"
 
     $SQLCMD -Q "
-        RESTORE DATABASE [CRONUS] FROM DISK='$BAK_PATH'
-        WITH MOVE '$DATA_NAME' TO '/var/opt/mssql/data/CRONUS.mdf',
-             MOVE '$LOG_NAME' TO '/var/opt/mssql/data/CRONUS_log.ldf'
+        RESTORE DATABASE [$BC_DATABASE] FROM DISK='$BAK_PATH'
+        WITH MOVE '$DATA_NAME' TO '/var/opt/mssql/data/$BC_DATABASE.mdf',
+             MOVE '$LOG_NAME' TO '/var/opt/mssql/data/${BC_DATABASE}_log.ldf'
     "
-    log_step "CRONUS restored."
+    log_step "$BC_DATABASE restored."
 else
-    log_step "CRONUS already exists."
+    log_step "$BC_DATABASE already exists."
 fi
 
-SQLCMD_DB="sqlcmd -S $SQL_SERVER -U $BC_DB_USER -P $BC_DB_PASSWORD -d CRONUS -C -No"
+SQLCMD_DB="sqlcmd -S $SQL_SERVER -U $BC_DB_USER -P $BC_DB_PASSWORD -d $BC_DATABASE -C -No"
 
 # Encryption key
 $SQLCMD_DB -Q "
@@ -649,8 +905,30 @@ if [ -n "$LICENSE_TO_IMPORT" ]; then
     log_step "License imported: $(basename "$LICENSE_TO_IMPORT")"
 fi
 
-# Sandbox tenant type
+# Sandbox tenant type, and give the row the tenant id the NST actually uses.
+#
+# The CRONUS demo backup ships exactly one [$ndo$tenantproperty] row with
+# tenantid = '' (empty, not NULL). The NST runs tenant 'default' even with
+# Multitenant=false, and every tenant-property write is
+#   UPDATE [$ndo$tenantproperty] SET <field>=@p, lastmodified=getutcdate()
+#   WHERE tenantid=@tenantId
+# so with a blank tenantid EVERY such write silently matches zero rows. It is
+# an UPDATE, not an upsert, and nothing checks the row count.
+#
+# That is why AL encryption did not work here (issue #66). CreateKey() writes
+# the RSA key file to disk, then sets StoredEncryptionFileName — which goes to
+# this table, matched nothing, and read back empty — so the very next line's
+# RequireKeyCreatedAndPresent() threw NavEncryptionNotCreatedException ("An
+# encryption key is required to complete the request."). The key existed on
+# disk; the tier just could not remember its name. Diagnosed by noticing that
+# lastmodified was three days stale after several CreateKey calls.
+#
+# With tenantid set, real encryption works with Patch #26 disabled: measured on
+# BC 28.4, EnableEncryption succeeds and EncryptText returns 344 bytes of real
+# ciphertext instead of the pass-through proxy's 16.
 $SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenanttype = 1;" 2>/dev/null
+$SQLCMD_DB -Q "UPDATE [\$ndo\$tenantproperty] SET tenantid = N'default' WHERE ISNULL(tenantid, N'') = N'';" 2>/dev/null
+log_step "Tenant property row keyed to tenant 'default' (was blank; every tenant-property write matched 0 rows)"
 
 # Normalize demo-DB user time zones to UTC. The CRONUS backup ships
 # [User Personalization].[Time Zone] = 'Europe/Amsterdam' for the default
@@ -663,12 +941,12 @@ $SQLCMD_DB -Q "UPDATE [User Personalization] SET [Time Zone] = N'UTC' WHERE [Tim
 # SQL performance tuning for CI/CD — disable safety overhead not needed for test runs
 # ALTER DATABASE must run from master context, not from within the target database
 $SQLCMD -Q "
-ALTER DATABASE CRONUS SET QUERY_STORE = OFF;
-ALTER DATABASE CRONUS SET AUTO_UPDATE_STATISTICS OFF;
-ALTER DATABASE CRONUS SET AUTO_UPDATE_STATISTICS_ASYNC OFF;
-ALTER DATABASE CRONUS SET AUTO_CREATE_STATISTICS OFF;
-ALTER DATABASE CRONUS SET PAGE_VERIFY NONE;
-ALTER DATABASE CRONUS SET DELAYED_DURABILITY = FORCED;
+ALTER DATABASE [$BC_DATABASE] SET QUERY_STORE = OFF;
+ALTER DATABASE [$BC_DATABASE] SET AUTO_UPDATE_STATISTICS OFF;
+ALTER DATABASE [$BC_DATABASE] SET AUTO_UPDATE_STATISTICS_ASYNC OFF;
+ALTER DATABASE [$BC_DATABASE] SET AUTO_CREATE_STATISTICS OFF;
+ALTER DATABASE [$BC_DATABASE] SET PAGE_VERIFY NONE;
+ALTER DATABASE [$BC_DATABASE] SET DELAYED_DURABILITY = FORCED;
 " 2>/dev/null
 # Disable change tracking (must disable on tables first, from CRONUS context)
 $SQLCMD_DB -Q "
@@ -679,7 +957,7 @@ JOIN sys.tables t ON ct.object_id = t.object_id
 JOIN sys.schemas s ON t.schema_id = s.schema_id;
 IF LEN(@sql) > 0 EXEC sp_executesql @sql;
 " 2>/dev/null
-$SQLCMD -Q "ALTER DATABASE CRONUS SET CHANGE_TRACKING = OFF;" 2>/dev/null
+$SQLCMD -Q "ALTER DATABASE [$BC_DATABASE] SET CHANGE_TRACKING = OFF;" 2>/dev/null
 log_step "SQL tuned for CI/CD (query store, stats, page verify, change tracking OFF)"
 
 # Clear pre-installed apps before BC starts.
@@ -860,6 +1138,20 @@ fi
 # an "ADMIN" user; override via BC_SERVER_USERNAME/BC_SERVER_PASSWORD (docker-compose.yml
 # passes these through — see the comment there). GUID 00000000-0000-0000-0000-000000000001.
 #
+# [User].[Expiry Date] MUST be '1753-01-01' (BC's "never expires" sentinel/NavDateTime.Undefined),
+# NOT a real future date like '2099-12-31' -- confirmed by decompiling
+# SystemTableTriggers.CheckForExistenceOfSuperUserIfNecessaryAsync (Nav.Ncl.dll): its
+# GenerateSuperUserAuthenticationMethodQuery join filters candidate SUPER users to
+# expiryDateField.Equal(NavDateTime.Undefined), so a real Expiry Date -- even one far in the
+# future and clearly intended to mean "does not expire" -- silently excludes the user from
+# that query, making CheckSuperUserAuthenticationMethodQueryAsync see zero qualifying rows and
+# throw "You must assign at least one user the SUPER permission set...". This fires on ANY
+# operation that commits a transaction while requiring a live SUPER user check -- reproduced
+# via extension installs (e.g. publishing Continia OPplus), not something specific to that app.
+# 2099-12-31 was previously used here on the mistaken assumption that BC just wants "a date far
+# enough in the future"; the platform's own convention (see [User Property].[WebServices Key
+# Expiry Date] two lines below, which already correctly used 1753-01-01) says otherwise.
+#
 # The stored password hash is a fixed placeholder, NOT a hash of BC_SERVER_PASSWORD —
 # NavUser.TryAuthenticate's hash check doesn't verify on Linux (the Windows hash format
 # doesn't port; StartupHook Patch #16b bypasses verification and always returns true),
@@ -869,32 +1161,69 @@ fi
 # NavUserPassword-eligible. That means BC_SERVER_PASSWORD is honored end-to-end (that
 # value really does work at every login surface) without needing to reproduce BC's
 # hash algorithm, which isn't documented anywhere outside the platform binaries.
+# The helper reads the password from stdin and creates Microsoft's V3 representation;
+# plaintext is never passed on argv, written to SQL, or logged.
 USER_GUID='00000000-0000-0000-0000-000000000001'
 BC_SERVER_USERNAME="${BC_SERVER_USERNAME:-BCRUNNER}"
 BC_SERVER_PASSWORD="${BC_SERVER_PASSWORD:-Admin123!}"
-PASSWORD_HASH='aXD91GRctWiXaqXeWbXhxQ==-V3'
-$SQLCMD_DB -Q "
-IF NOT EXISTS (SELECT 1 FROM [User] WHERE [User Name] = N'$BC_SERVER_USERNAME')
+if [ -z "$BC_SERVER_PASSWORD" ]; then
+    log_step "ERROR: BC_SERVER_PASSWORD must not be empty"
+    exit 1
+fi
+PASSWORD_HASH=$(printf '%s' "$BC_SERVER_PASSWORD" | \
+    env DOTNET_STARTUP_HOOKS= /bc/tools/NavUserPasswordInspector/NavUserPasswordInspector generate \
+        --user-security-id "$USER_GUID")
+if [[ ! "$PASSWORD_HASH" =~ ^[A-Za-z0-9+/]{22}==-V3$ ]]; then
+    log_step "ERROR: password generator returned an invalid V3 representation"
+    exit 1
+fi
+$SQLCMD_DB -b -Q "
+IF NOT EXISTS (SELECT 1 FROM [User] WHERE [User Security ID] = '$USER_GUID')
 BEGIN
     INSERT INTO [User] ([User Security ID], [User Name], [Full Name], [State], [Expiry Date],
         [Windows Security ID], [Change Password], [License Type], [Authentication Email],
         [Contact Email], [Exchange Identifier], [Application ID],
         [\$systemId], [\$systemCreatedAt], [\$systemCreatedBy], [\$systemModifiedAt], [\$systemModifiedBy])
-    VALUES ('$USER_GUID', N'$BC_SERVER_USERNAME', N'BC Runner', 0, '2099-12-31', N'S-1-5-21-2074085148-119339936-2019613796-1001', 0, 0, N'', N'', N'',
+    VALUES ('$USER_GUID', N'$BC_SERVER_USERNAME', N'BC Runner', 0, '1753-01-01', N'S-1-5-21-2074085148-119339936-2019613796-1001', 0, 0, N'', N'', N'',
         '00000000-0000-0000-0000-000000000000',
         NEWID(), GETUTCDATE(), '$USER_GUID', GETUTCDATE(), '$USER_GUID');
+END
+ELSE
+BEGIN
+    UPDATE [User]
+    SET [User Name] = N'$BC_SERVER_USERNAME', [\$systemModifiedAt] = GETUTCDATE(),
+        [\$systemModifiedBy] = '$USER_GUID'
+    WHERE [User Security ID] = '$USER_GUID';
+END;
+
+IF NOT EXISTS (SELECT 1 FROM [User Property] WHERE [User Security ID] = '$USER_GUID')
+BEGIN
     INSERT INTO [User Property] ([User Security ID], [Password], [Name Identifier],
         [Authentication Key], [WebServices Key], [WebServices Key Expiry Date],
         [Authentication Object ID], [Directory Role ID], [Telemetry User ID],
         [\$systemId], [\$systemCreatedAt], [\$systemCreatedBy], [\$systemModifiedAt], [\$systemModifiedBy])
     VALUES ('$USER_GUID', N'$PASSWORD_HASH', N'', N'', N'', '1753-01-01', N'', N'', '$USER_GUID',
         NEWID(), GETUTCDATE(), '$USER_GUID', GETUTCDATE(), '$USER_GUID');
+END
+ELSE
+BEGIN
+    UPDATE [User Property]
+    SET [Password] = N'$PASSWORD_HASH', [\$systemModifiedAt] = GETUTCDATE(),
+        [\$systemModifiedBy] = '$USER_GUID'
+    WHERE [User Security ID] = '$USER_GUID';
+END;
+
+IF NOT EXISTS (SELECT 1 FROM [Access Control]
+               WHERE [User Security ID] = '$USER_GUID' AND [Role ID] = N'SUPER'
+                 AND [Company Name] = N'' AND [Scope] = 0
+                 AND [App ID] = '00000000-0000-0000-0000-000000000000')
+BEGIN
     INSERT INTO [Access Control] ([User Security ID], [Role ID], [Company Name], [Scope], [App ID],
         [\$systemId], [\$systemCreatedAt], [\$systemCreatedBy], [\$systemModifiedAt], [\$systemModifiedBy])
     VALUES ('$USER_GUID', N'SUPER', N'', 0, '00000000-0000-0000-0000-000000000000',
         NEWID(), GETUTCDATE(), '$USER_GUID', GETUTCDATE(), '$USER_GUID');
 END
-" 2>/dev/null
+"
 
 # Background SUPER user — safety net so tests can freely disable/delete users
 # without violating the "at least one enabled SUPER user" platform constraint.
@@ -908,7 +1237,7 @@ BEGIN
         [Windows Security ID], [Change Password], [License Type], [Authentication Email],
         [Contact Email], [Exchange Identifier], [Application ID],
         [\$systemId], [\$systemCreatedAt], [\$systemCreatedBy], [\$systemModifiedAt], [\$systemModifiedBy])
-    VALUES ('$SVC_GUID', N'YOURBC-SERVICEUSER', N'BC Service', 0, '2099-12-31', N'S-1-5-21-572246948-1269080603-559786204-1001', 0, 0, N'', N'', N'',
+    VALUES ('$SVC_GUID', N'YOURBC-SERVICEUSER', N'BC Service', 0, '1753-01-01', N'S-1-5-21-572246948-1269080603-559786204-1001', 0, 0, N'', N'', N'',
         '00000000-0000-0000-0000-000000000000',
         NEWID(), GETUTCDATE(), '$SVC_GUID', GETUTCDATE(), '$SVC_GUID');
     INSERT INTO [User Property] ([User Security ID], [Password], [Name Identifier],
@@ -923,7 +1252,7 @@ BEGIN
         NEWID(), GETUTCDATE(), '$SVC_GUID', GETUTCDATE(), '$SVC_GUID');
 END
 " 2>/dev/null
-log_step "Database ready ($BC_SERVER_USERNAME / $BC_SERVER_PASSWORD). Step 3 (DB setup): $(($(date +%s) - STEP3_START))s"
+log_step "Database ready ($BC_SERVER_USERNAME). Step 3 (DB setup): $(($(date +%s) - STEP3_START))s"
 
 # =============================================================================
 # Step 4: Start BC server in background, publish test runner, then wait
@@ -931,12 +1260,12 @@ log_step "Database ready ($BC_SERVER_USERNAME / $BC_SERVER_PASSWORD). Step 3 (DB
 cd "$SERVICE_DIR"
 # Verify SQL is still accessible before starting BC
 log_step "Verifying SQL connection..."
-if sqlcmd -S "$SQL_SERVER" -U "$BC_DB_USER" -P "$BC_DB_PASSWORD" -d CRONUS -C -No -Q "SELECT 1" &>/dev/null; then
+if sqlcmd -S "$SQL_SERVER" -U "$BC_DB_USER" -P "$BC_DB_PASSWORD" -d "$BC_DATABASE" -C -No -Q "SELECT 1" &>/dev/null; then
     log_step "SQL connection verified."
 else
     log_step "ERROR: SQL connection failed! Retrying..."
     sleep 5
-    sqlcmd -S "$SQL_SERVER" -U "$BC_DB_USER" -P "$BC_DB_PASSWORD" -d CRONUS -C -No -Q "SELECT 1" || {
+    sqlcmd -S "$SQL_SERVER" -U "$BC_DB_USER" -P "$BC_DB_PASSWORD" -d "$BC_DATABASE" -C -No -Q "SELECT 1" || {
         log_step "FATAL: Cannot connect to SQL"
         exit 1
     }
@@ -1010,8 +1339,12 @@ if [ -n "$PLATFORM_VER" ]; then
         fi
         for _inst in "MicrosoftDynamicsNavServer" "$INSTANCE"; do
             _link="$SERVER_BASE/MicrosoftDynamicsNavServer\$${_inst}/apps/assembly"
-            [ -L "$_link" ] && continue
+            # Create the target before trusting an existing link: a restarted
+            # (not recreated) container keeps its links, and the clear above
+            # just deleted what they point to. A dangling link makes the
+            # `mkdir -p` of the seed targets below fail with "File exists".
             mkdir -p "$(dirname "$_link")" "/bc/assembly-cache/$_inst"
+            [ -L "$_link" ] && continue
             rm -rf "$_link"
             ln -s "/bc/assembly-cache/$_inst" "$_link"
         done
@@ -1043,7 +1376,7 @@ if [ -n "$PLATFORM_VER" ]; then
     # above) and have the seeder ALSO write each Merkle json under the
     # runtime-package-id name.
     R2R_PKGMAP="/tmp/r2r-pkgmap.csv"
-    $SQLCMD -d CRONUS -h -1 -W -Q "SET NOCOUNT ON; SELECT LOWER(CONVERT(varchar(36),[ID])) + ',' + UPPER(REPLACE(CONVERT(varchar(36),[Runtime Package ID]),'-','')) FROM [Published Application]" > "$R2R_PKGMAP" 2>/dev/null || : > "$R2R_PKGMAP"
+    $SQLCMD -d "$BC_DATABASE" -h -1 -W -Q "SET NOCOUNT ON; SELECT LOWER(CONVERT(varchar(36),[ID])) + ',' + UPPER(REPLACE(CONVERT(varchar(36),[Runtime Package ID]),'-','')) FROM [Published Application]" > "$R2R_PKGMAP" 2>/dev/null || : > "$R2R_PKGMAP"
     R2R_SEEDED=0
     R2R_FILTERED=0
     R2R_FAILED=0
@@ -1132,6 +1465,42 @@ else
     log_step "WARN: Could not determine platform version; skipping R2R pre-seed"
 fi
 
+# Keep the tenant encryption keys on the service volume.
+#
+# RsaEncryptionProviderBase writes the RSA key file to
+# /usr/share/Microsoft/Microsoft Dynamics NAV/<ver>/Server/Keys/<tenant>_<guid>.key,
+# which is on the container's own filesystem, not on a volume. The key file name
+# IS persisted (in [$ndo$tenantproperty], see the tenantid fix in Step 3), so
+# after a container recreate BC remembers a key whose file is gone and every
+# decrypt fails with NavEncryptionKeyNotFoundException rather than "no key".
+# Symlink the directory onto /bc/service so the two halves survive together.
+# Runs on every boot: the symlink lives on the ephemeral layer even when the
+# stamped Step 2 is skipped.
+BC_KEYS_DIR="/bc/service/Keys"
+mkdir -p "$BC_KEYS_DIR"
+for _server_dir in /usr/share/Microsoft/"Microsoft Dynamics NAV"/*/Server; do
+    [ -d "$_server_dir" ] || continue
+    _keys_link="$_server_dir/Keys"
+    if [ -L "$_keys_link" ]; then
+        continue
+    fi
+    if [ -d "$_keys_link" ]; then
+        # Real directory from an earlier boot — move anything in it onto the volume
+        # before replacing it, so a key created before this change is not lost.
+        find "$_keys_link" -maxdepth 1 -type f -name '*.key' -exec mv -n {} "$BC_KEYS_DIR"/ \; 2>/dev/null || true
+        rm -rf "$_keys_link"
+    fi
+    ln -sfn "$BC_KEYS_DIR" "$_keys_link"
+    log_step "Encryption keys directory linked to the service volume ($_keys_link -> $BC_KEYS_DIR)"
+done
+
+# Encryption state at the moment the tier starts (issue #103). The tier can die in
+# NavTenantCollection.ConfigureTenants with NavEncryptionNotCreatedException while
+# comparing its key with the one in the database, and the writes above are silenced,
+# so a bad boot left nothing to compare against a good one. One line, read-only.
+_enc_sql() { $SQLCMD_DB -h -1 -W -Q "SET NOCOUNT ON; $1" 2>&1 | head -1 | tr -d '\r'; }
+log_step "Encryption state before NST start: public-key rows=$(_enc_sql "SELECT COUNT(*) FROM [\$ndo\$publicencryptionkey]") tenant-key-file='$(_enc_sql "SELECT ISNULL(encryptionkeyfilename, N'') FROM [\$ndo\$tenantproperty]")' tenant-id='$(_enc_sql "SELECT ISNULL(tenantid, N'') FROM [\$ndo\$tenantproperty]")' keys-dir=[$(ls "$BC_KEYS_DIR" 2>/dev/null | tr '\n' ' ')]"
+
 log_step "Starting BC service tier..."
 # Start BC — use a FIFO to keep stdin open for /console mode
 mkfifo /tmp/bc-stdin 2>/dev/null || true
@@ -1164,9 +1533,19 @@ if [ "${BC_PROFILE_NST:-0}" = "1" ]; then
     export DOTNET_DiagnosticPorts="/tmp/nst-diag.sock,suspend"
 fi
 
-DOTNET_STARTUP_HOOKS=/bc/hook/StartupHook.dll dotnet Microsoft.Dynamics.Nav.Server.dll /console < /tmp/bc-stdin &
-BC_PID=$!
-# Keep the FIFO writer open in background (prevents EOF)
+# Launches (or relaunches) the NST process and records its pid to
+# /tmp/bc-nst.pid — scripts/restart-service.sh polls that file to detect a
+# respawn. Reused both for the initial boot and for every soft-restart the
+# supervisor loop below performs, so the two paths cannot drift apart.
+start_nst() {
+    DOTNET_STARTUP_HOOKS=/bc/hook/StartupHook.dll dotnet Microsoft.Dynamics.Nav.Server.dll /console < /tmp/bc-stdin &
+    BC_PID=$!
+    echo "$BC_PID" > /tmp/bc-nst.pid
+}
+
+start_nst
+# Keep the FIFO writer open in background (prevents EOF); survives across
+# soft-restarts since it is never closed or recreated.
 exec 3>/tmp/bc-stdin
 
 # Wait for dev endpoint to be ready, then publish test runner
@@ -1178,6 +1557,10 @@ exec 3>/tmp/bc-stdin
 
     INSTANCE=$(grep -oP 'ServerInstance" value="\K[^"]+' $SERVICE_DIR/CustomSettings.config 2>/dev/null || echo "BC")
     DEV_URL="http://localhost:7049"
+    # How long each dev-endpoint publish below may take. These were 120s and
+    # 300s, and a publish on BC 29.0 has taken 2:28. Same variable and default
+    # as scripts/publish-app.sh.
+    PUBLISH_TIMEOUT="${BC_PUBLISH_TIMEOUT:-600}"
     NST_WAIT_START=$(date +%s)
 
     echo "[entrypoint] [$(( $(date +%s) - ENTRYPOINT_START ))s] Waiting for BC to start..."
@@ -1201,7 +1584,9 @@ exec 3>/tmp/bc-stdin
     # Replace Reporting Service .exe with sleep stub NOW (after BC startup probed the assembly).
     # The SideServiceWatchdog will call Process.Start on this path and see a live process.
     REPORT_EXE="$SERVICE_DIR/SideServices/Microsoft.BusinessCentral.Reporting.Service.exe"
-    if [ -f "$REPORT_EXE" ] && [ ! -f "${REPORT_EXE}.win" ]; then
+    if [ "${BC_RDLC_ACTIVE:-0}" = "1" ]; then
+        echo "[entrypoint] Keeping the real Reporting Service .exe (Mono RDLC renderer active)"
+    elif [ -f "$REPORT_EXE" ] && [ ! -f "${REPORT_EXE}.win" ]; then
         mv "$REPORT_EXE" "${REPORT_EXE}.win"
         printf '#!/bin/sh\nexec sleep infinity\n' > "$REPORT_EXE"
         chmod +x "$REPORT_EXE"
@@ -1355,7 +1740,7 @@ PYEOF
                     continue
                 fi
 
-                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 300 \
+                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_FILE;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=forcesync" 2>/dev/null)
@@ -1459,7 +1844,7 @@ PYEOF
                 # the only valid values, none of which auto-install missing
                 # tenant deps), so we have to wipe stuck-published apps in
                 # SQL beforehand instead.
-                HTTP=$(curl -s -o /tmp/install-tenant.out -w "%{http_code}" --max-time 120 \
+                HTTP=$(curl -s -o /tmp/install-tenant.out -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)
@@ -1524,7 +1909,7 @@ PYEOF
             while IFS= read -r APP_PATH; do
                 [ -z "$APP_PATH" ] && continue
                 NAME=$(basename "$APP_PATH")
-                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
+                HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$PUBLISH_TIMEOUT" \
                     -u "$BC_SERVER_USERNAME:$BC_SERVER_PASSWORD" -X POST \
                     -F "file=@$APP_PATH;type=application/octet-stream" \
                     "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>/dev/null)
@@ -1562,6 +1947,21 @@ PYEOF
                 -F "file=@/bc/testrunner/TestRunner.app;type=application/octet-stream" \
                 "$DEV_URL/apps?SchemaUpdateMode=synchronize" 2>&1)
             echo "[entrypoint] Test Runner Extension: HTTP $HTTP_CODE"
+
+            # Report the tenant encryption key (issue #75). The key itself is
+            # created by that extension's install codeunit, through BC's own
+            # CreateEncryptionKey() — this only reads back what the tier
+            # recorded, so a tier without a key says so in the boot log
+            # instead of surfacing as "An encryption key is required to
+            # complete the request." in the first AL test that encrypts.
+            ENC_KEY_FILE=$($SQLCMD_DB -h -1 -W -Q "SET NOCOUNT ON; SELECT ISNULL(encryptionkeyfilename, N'') FROM [\$ndo\$tenantproperty];" 2>/dev/null | head -1 | tr -d '\r')
+            if [ -n "$ENC_KEY_FILE" ] && [ -f "$BC_KEYS_DIR/$ENC_KEY_FILE" ]; then
+                echo "[entrypoint] Tenant encryption key: $ENC_KEY_FILE"
+            elif [ -n "$ENC_KEY_FILE" ]; then
+                echo "[entrypoint] WARN: tenant records encryption key '$ENC_KEY_FILE' but $BC_KEYS_DIR/$ENC_KEY_FILE is missing — AL decryption will fail"
+            else
+                echo "[entrypoint] WARN: no tenant encryption key — AL encryption calls will fail with 'An encryption key is required to complete the request.'"
+            fi
         fi
     fi
     TOTAL_ELAPSED=$(( $(date +%s) - ENTRYPOINT_START ))
@@ -1584,4 +1984,28 @@ PYEOF
     fi
 ) &
 
-wait $BC_PID
+# Supervise the NST process for the life of the container. A plain `wait
+# $BC_PID` here would mean the only way to bounce NST is to kill this whole
+# container (PID 1 exits right after `wait` returns, taking the container
+# with it — verified: `docker exec ... kill -TERM <nst-pid>` exits the
+# container with rc 143). scripts/restart-service.sh drops a
+# /tmp/bc-restart-requested marker and sends NST SIGTERM; when that marker
+# is present at exit we relaunch instead of exiting, so a docker exec can
+# cleanly bounce just the service tier — restart-service.sh is the intended
+# entry point, not sending the signal directly.
+while true; do
+    # `wait` as a bare command would trip `set -e` (line 4) the instant NST
+    # exits non-zero — including on the SIGTERM restart-service.sh sends for
+    # a deliberate soft-restart — and kill this script before RC is even
+    # read. `|| RC=$?` puts `wait` on the left of `||`, which set -e exempts.
+    RC=0
+    wait "$BC_PID" || RC=$?
+    if [ -f /tmp/bc-restart-requested ]; then
+        rm -f /tmp/bc-restart-requested
+        echo "[entrypoint] NST exited (rc=$RC) — restart requested, relaunching"
+        start_nst
+        continue
+    fi
+    echo "[entrypoint] NST exited (rc=$RC) — no restart requested, container is stopping"
+    exit "$RC"
+done

@@ -115,6 +115,18 @@ table 99903 "Codeunit Run Request"
             Caption = 'Last Execution (UTC)';
             DataClassification = SystemMetadata;
         }
+
+        /// <summary>
+        /// The test runner codeunit SetupSuite and SetupSuiteAppend give the DEFAULT suite
+        /// (issue #193). 0 means 130450 "Test Runner - Isol. Codeunit", BcContainerHelper's
+        /// default. Set it to run the suite through another runner, such as a test app's own
+        /// codeunit with Subtype = TestRunner (BcContainerHelper's -testRunnerCodeunitId).
+        /// </summary>
+        field(7; TestRunnerId; Integer)
+        {
+            Caption = 'Test Runner Id';
+            DataClassification = SystemMetadata;
+        }
     }
 
     keys
@@ -179,6 +191,7 @@ page 99902 "Codeunit Run Requests"
                 field(Id; Rec.Id) { Editable = false; }
                 field(CodeunitId; Rec.CodeunitId) { }
                 field(CodeunitIds; Rec.CodeunitIds) { }
+                field(TestRunnerId; Rec.TestRunnerId) { }
                 field(Status; Rec.Status) { Editable = false; }
                 field(LastResult; Rec.LastResult) { Editable = false; }
                 field(LastExecutionUTC; Rec.LastExecutionUTC) { Editable = false; }
@@ -206,18 +219,14 @@ page 99902 "Codeunit Run Requests"
     /// Sets up the test suite (creates suite, discovers test methods) without running.
     /// Used by the WebSocket test runner to populate the suite before executing via
     /// page 130455 which requires a client session for TestPage support.
+    ///
+    /// CLEARS the suite first. Call SetupSuiteAppend for every part after the
+    /// first when the codeunit list is too long for one CodeunitIds field.
     /// </summary>
     [ServiceEnabled]
     procedure SetupSuite(): Boolean
     var
         SuiteRunner: Codeunit "Test Suite Runner";
-        IdList: List of [Text];
-        IdText: Text;
-        CuId: Integer;
-        RangeStart: Integer;
-        RangeEnd: Integer;
-        i: Integer;
-        DashPos: Integer;
     begin
         if Rec.CodeunitIds = '' then
             exit(false);
@@ -226,26 +235,75 @@ page 99902 "Codeunit Run Requests"
         // 130450 = TestIsolation=Codeunit (fresh session per codeunit) ← CORRECT
         // 130451 = TestIsolation=Disabled (no isolation) ← WRONG, causes cascading failures
         SuiteRunner.InitSuite('DEFAULT');
-        OverrideSuiteRunner('DEFAULT', 130450);
+        OverrideSuiteRunner('DEFAULT', SuiteRunnerId());
+        exit(AddRequestedCodeunits(SuiteRunner, 'Suite ready') > 0);
+    end;
 
-        // Parse comma-separated IDs and ranges (same as RunCodeunit)
+    /// <summary>
+    /// Adds this request's codeunits to the DEFAULT suite WITHOUT clearing it.
+    ///
+    /// CodeunitIds is Text[2048], so a long list has to be posted in parts.
+    /// Setting each part up with SetupSuite and running it before posting the
+    /// next one means every part is a separate TestRunner process and so a
+    /// separate client session, and session-scoped state — SingleInstance
+    /// codeunit instances above all — restarts at every part boundary. A real
+    /// tier runs the whole suite in one session (issue #74). With this action
+    /// the caller populates the whole suite first and then runs it once.
+    ///
+    /// Safe to repeat: AddTestCodeunit ignores a codeunit already in the
+    /// suite, so a retried part does not run its tests twice.
+    /// </summary>
+    [ServiceEnabled]
+    procedure SetupSuiteAppend(): Boolean
+    var
+        SuiteRunner: Codeunit "Test Suite Runner";
+    begin
+        if Rec.CodeunitIds = '' then
+            exit(false);
+
+        SuiteRunner.InitSuiteKeep('DEFAULT');
+        OverrideSuiteRunner('DEFAULT', SuiteRunnerId());
+        exit(AddRequestedCodeunits(SuiteRunner, 'Suite extended') > 0);
+    end;
+
+    /// <summary>
+    /// Parses CodeunitIds (comma-separated ids and "start-end" ranges, same
+    /// format RunCodeunit accepts) and adds each one to the suite. Returns how
+    /// many ids it managed to parse, so a caller can tell "nothing to do" from
+    /// "the field held nothing usable".
+    /// </summary>
+    local procedure AddRequestedCodeunits(var SuiteRunner: Codeunit "Test Suite Runner"; ResultText: Text): Integer
+    var
+        IdList: List of [Text];
+        IdText: Text;
+        CuId: Integer;
+        RangeStart: Integer;
+        RangeEnd: Integer;
+        i: Integer;
+        DashPos: Integer;
+        Added: Integer;
+    begin
         IdList := Rec.CodeunitIds.Split(',');
         foreach IdText in IdList do begin
             DashPos := IdText.IndexOf('-');
             if DashPos > 0 then begin
                 if Evaluate(RangeStart, IdText.Substring(1, DashPos - 1)) and
                    Evaluate(RangeEnd, IdText.Substring(DashPos + 1)) then
-                    for i := RangeStart to RangeEnd do
+                    for i := RangeStart to RangeEnd do begin
                         SuiteRunner.AddTestCodeunit(i);
+                        Added += 1;
+                    end;
             end else
-                if Evaluate(CuId, IdText) then
+                if Evaluate(CuId, IdText) then begin
                     SuiteRunner.AddTestCodeunit(CuId);
+                    Added += 1;
+                end;
         end;
 
         Rec.Status := Rec.Status::Pending;
-        Rec.LastResult := 'Suite ready';
+        Rec.LastResult := CopyStr(StrSubstNo('%1 (%2 codeunits)', ResultText, Added), 1, MaxStrLen(Rec.LastResult));
         Rec.Modify(true);
-        exit(true);
+        exit(Added);
     end;
 
     /// <summary>
@@ -287,6 +345,14 @@ page 99902 "Codeunit Run Requests"
         Rec.LastResult := StrSubstNo('Disabled %1 tests', DisabledCount);
         Rec.Modify(true);
         exit(true);
+    end;
+
+    /// <summary>TestRunnerId, or 130450 when it is 0.</summary>
+    local procedure SuiteRunnerId(): Integer
+    begin
+        if Rec.TestRunnerId = 0 then
+            exit(130450);
+        exit(Rec.TestRunnerId);
     end;
 
     local procedure OverrideSuiteRunner(SuiteName: Code[10]; RunnerId: Integer)

@@ -16,14 +16,13 @@ name: Test BC Versions
 # reads Microsoft's artifact indexes at run time and produces two groups:
 #
 #   test          REQUIRED. Released versions from the public sandbox index,
-#                 newest `majors_back` majors (default 2 → 27 and 28 today).
+#                 every major from `min_major` up (default 27 → 27, 28 and 29
+#                 today). New majors join on their own when released.
 #                 A failure here is a real bc-linux regression.
 #
 #   test-preview  NON-BLOCKING. The next major and the next minor from the
 #                 INSIDER index, fed in as a full BC_ARTIFACT_URL. These are
-#                 early warning about unreleased BC builds; the next-major
-#                 leg is expected to fail today (BC 29 targets .NET 10, the
-#                 bc-runner image ships .NET 8).
+#                 early warning about unreleased BC builds.
 #
 # The `versions:` dispatch input still short-circuits both: pass
 # "27.0,28.1" and you get exactly those two legs and no preview.
@@ -36,10 +35,10 @@ on:
         required: false
         default: ''
         type: string
-      majors_back:
-        description: 'How many of the newest BC majors the REQUIRED matrix covers (2 = today''s 27 + 28). Used when "versions" is empty.'
+      min_major:
+        description: 'Lowest BC major the REQUIRED matrix covers; every released major from here up is tested (27 = 27, 28, 29, ...). Used when "versions" is empty.'
         required: false
-        default: '2'
+        default: '27'
         type: string
       include_preview:
         description: 'Also run the non-blocking insider preview legs (next major + next minor). Ignored when "versions" is set.'
@@ -78,7 +77,7 @@ jobs:
         # Only workflow_dispatch supplies these; on push/PR/schedule they
         # evaluate to empty and the defaults below apply.
         VERSIONS: ${{ inputs.versions }}
-        MAJORS_BACK: ${{ inputs.majors_back }}
+        MIN_MAJOR: ${{ inputs.min_major }}
         # Preview legs are on by default everywhere except when a dispatch
         # explicitly unticks the box. `inputs.include_preview` is empty (not
         # 'true') on push/PR/schedule, hence the event_name guard.
@@ -110,17 +109,17 @@ jobs:
         # against, so the matrix and the actual download always agree on
         # what "latest" means, and emits SHORT versions so a hotfix landing
         # mid-run is picked up rather than skipped.
-        MB="${MAJORS_BACK:-2}"
-        if [ -z "$MB" ]; then MB=2; fi
-        echo "Discovering released BC versions (newest $MB majors)..."
-        MATRIX=$(python3 scripts/discover-bc-versions.py --mode released --majors-back "$MB")
+        MM="${MIN_MAJOR:-27}"
+        if [ -z "$MM" ]; then MM=27; fi
+        echo "Discovering released BC versions (major $MM and newer)..."
+        MATRIX=$(python3 scripts/discover-bc-versions.py --mode released --min-major "$MM")
         echo "Required matrix: $MATRIX"
 
         if [ "$INCLUDE_PREVIEW" = "true" ]; then
           echo "Discovering insider preview versions..."
           # A wobble on the insider index must not take the required matrix
           # down with it — preview is a bonus, not a gate.
-          if P=$(python3 scripts/discover-bc-versions.py --mode preview --majors-back "$MB"); then
+          if P=$(python3 scripts/discover-bc-versions.py --mode preview --min-major "$MM"); then
             COUNT=$(P="$P" python3 -c "import os,json; print(len(json.loads(os.environ['P'])['include']))")
             PREVIEW="$P"
             if [ "$COUNT" -gt 0 ]; then HAS_PREVIEW=true; fi
@@ -264,6 +263,13 @@ jobs:
       # docker-compose.yml defaults to, so this stays a gate on what
       # consumers actually get rather than on a parallel configuration.
       test_app_dirs: extensions/smoke-test
+      # TimerError.Codeunit.al (issue #136) declares Microsoft.Dynamics.Nav.Timer,
+      # which ships in the service folder, and System.EventArgs from mscorlib. AL
+      # compilers before 18.0 find mscorlib only in a probing path; the web
+      # client's refs folder has one.
+      assembly_probing_paths: |
+        platform/ServiceTier/PFiles64/Microsoft Dynamics NAV/*/Service
+        platform/WebClient/PFiles/Microsoft Dynamics NAV/*/Web Client/WebPublish/refs
       # The smoke-test fixture ships a placeholder runtime ("14.0") so one
       # committed app.json spans the whole version matrix; "auto" opts into
       # the per-leg rewrite (27 → 16.0, 28 → 17.0). Consumer repos should
@@ -273,7 +279,19 @@ jobs:
       # the hosted runner so a regression in run-tests.sh's normalization shows
       # up here. Equivalent to the legacy "70000..70001" but covers the new
       # code path. See scripts/run-tests.sh CODEUNIT_RANGE handling.
-      codeunit_range: "70000|70001"
+      # 70012 (file dialogs, hub Patch #36) runs on the hub on 28+; 70020 (part
+      # Confirm) and 70023 (moved table) guard the classifier's routing to the
+      # websocket runner (issues #138-#141). 70040 and 70041 guard the Windows month
+      # names and the "Time Zone" table (#134, #132). 70051 (control add-in), 70053
+      # (Media bytes) and 70055 (Timer trigger error) guard issues #133, #135 and #136.
+      # 70064 guards '?' in an in-memory filter and the license's date filter on BC 27 (#153).
+      # 70069 guards a section-break Word layout saved as PDF (#155), 70071 FormatRegion culture data (#157).
+      # 70075 guards TemporaryPath() agreeing between AL File and System.IO, and MediaSet.ImportFile file names (#175, #176, #181).
+      # 70042 guards the SecurityIdentifier stub (#137) and runs on BC 29+ only: it
+      # declares a DotNet framework type, and the AL 16/17 compilers of the BC 27/28 legs
+      # cannot resolve one on Linux (AL0451, also with the shared framework as a probing
+      # path). The preprocessor symbol below leaves the codeunit out of those legs' compile.
+      codeunit_range: ${{ (startsWith(matrix.bc_version, '27.') || startsWith(matrix.bc_version, '28.')) && '70000|70001|70008|70009|70012|70020|70023|70027|70040|70041|70051|70053|70055|70064|70069|70071|70073|70075|70076|70077' || '70000|70001|70008|70009|70012|70020|70023|70027|70040|70041|70042|70051|70053|70055|70064|70069|70071|70073|70075|70076|70077' }}
       # test_runner is left at its default ("auto"): each leg probes the
       # live server's dev endpoint and uses `al runtests` (the AL dotnet
       # tool's native runner driving the NST's /dev/TestRunnerHub) when
@@ -311,12 +329,17 @@ jobs:
       # Exercise preprocessor_symbols end-to-end on every matrix leg.
       # The smoke test has no #if guards so the symbol is a no-op at the AL
       # level, but it exercises the flag wiring through the workflow and alc.
-      preprocessor_symbols: "SMOKE"
+      preprocessor_symbols: ${{ (startsWith(matrix.bc_version, '27.') || startsWith(matrix.bc_version, '28.')) && 'SMOKE' || 'SMOKE,BCLINUX_DOTNET_FRAMEWORK' }}
       # Exercise the compiled-apps artifact upload end-to-end on every
       # matrix leg. Suffix must be unique per upload within the run (same
       # constraint as the junit artifact name above) — bc_version already
       # varies per leg, so reuse it.
       artifact_name_suffix: "${{ matrix.bc_version }}-required"
+      # verify_authentication defaults to false for consumers (see the
+      # reusable workflow's input doc) — but bc-linux's own matrix is
+      # exactly the regression gate that check exists for, so opt in here
+      # on every supported version.
+      verify_authentication: true
 
   # ─── Preview matrix: NON-BLOCKING insider legs ──────────────────────────
   #     The next BC major and the next minor, discovered from Microsoft's
@@ -359,6 +382,13 @@ jobs:
       # fail. Required legs keep the 30-minute default.
       health_timeout_minutes: 8
       test_app_dirs: extensions/smoke-test
+      # TimerError.Codeunit.al (issue #136) declares Microsoft.Dynamics.Nav.Timer,
+      # which ships in the service folder, and System.EventArgs from mscorlib. AL
+      # compilers before 18.0 find mscorlib only in a probing path; the web
+      # client's refs folder has one.
+      assembly_probing_paths: |
+        platform/ServiceTier/PFiles64/Microsoft Dynamics NAV/*/Service
+        platform/WebClient/PFiles/Microsoft Dynamics NAV/*/Web Client/WebPublish/refs
       runtime_version: auto
       codeunit_range: "70000|70001"
       runner_image: ${{ needs.build-image.outputs.runner_image }}
@@ -374,6 +404,10 @@ jobs:
       ruleset_file: "extensions/smoke-test/cops.rulset.json"
       enable_external_rulesets: true
       preprocessor_symbols: "SMOKE"
+      # Same reasoning as the required matrix: preview legs are the
+      # earliest place a wire-format regression on a new BC version would
+      # show up.
+      verify_authentication: true
 
   # Puts the "this was expected" framing in the run summary, so a red-ish
   # preview leg in the job list doesn't read as a regression to whoever
@@ -397,9 +431,6 @@ jobs:
           echo "(next major + next minor). They do **not** gate this workflow."
           echo "A failure here means an unreleased BC build does not run on"
           echo "bc-linux yet — early warning, not a regression."
-          echo
-          echo "Known-expected failure: the next-major leg targets .NET 10"
-          echo "while the bc-runner image ships .NET 8, so the NST cannot start."
           echo
           echo '```json'
           echo "$PREVIEW"

@@ -1339,8 +1339,12 @@ if [ -n "$PLATFORM_VER" ]; then
         fi
         for _inst in "MicrosoftDynamicsNavServer" "$INSTANCE"; do
             _link="$SERVER_BASE/MicrosoftDynamicsNavServer\$${_inst}/apps/assembly"
-            [ -L "$_link" ] && continue
+            # Create the target before trusting an existing link: a restarted
+            # (not recreated) container keeps its links, and the clear above
+            # just deleted what they point to. A dangling link makes the
+            # `mkdir -p` of the seed targets below fail with "File exists".
             mkdir -p "$(dirname "$_link")" "/bc/assembly-cache/$_inst"
+            [ -L "$_link" ] && continue
             rm -rf "$_link"
             ln -s "/bc/assembly-cache/$_inst" "$_link"
         done

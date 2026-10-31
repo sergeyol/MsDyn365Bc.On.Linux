@@ -807,6 +807,9 @@ execute_chunk() {
         # fails the copy, and the completeness step turns that into a loud
         # error rather than a stale or duplicated result set.
         local in_container_junit="/tmp/$(basename "$junit_path")"
+        # renew_flag is usually empty, so it is expanded as ${a[@]+"${a[@]}"}:
+        # macOS /bin/bash is 3.2, where "${a[@]}" of an empty array is an
+        # "unbound variable" error under `set -u`.
         local renew_flag=(); if [ "$RENEW_CLIENT_CONTEXT" = "1" ]; then renew_flag=(--renew-client-context); fi
         ( cd "$REPO_DIR" && printf '%s' "$AUTH_PASS" | docker compose exec -T bc \
             env DOTNET_STARTUP_HOOKS= dotnet /bc/tools/TestRunner/TestRunner.dll \
@@ -821,7 +824,7 @@ execute_chunk() {
             --timeout "$timeout_min" \
             --codeunit-timeout 10 \
             --max-iterations "$max_iter" \
-            "${renew_flag[@]}" \
+            ${renew_flag[@]+"${renew_flag[@]}"} \
             --junit-output "$in_container_junit" )
         rc=$?
         # </dev/null: `docker compose cp` inherits this script's stdin, and
@@ -849,7 +852,7 @@ execute_chunk() {
             --timeout "$timeout_min" \
             --codeunit-timeout 10 \
             --max-iterations "$max_iter" \
-            "${renew_flag[@]}" \
+            ${renew_flag[@]+"${renew_flag[@]}"} \
             --junit-output "$junit_path"
         rc=$?
     else
@@ -866,7 +869,7 @@ execute_chunk() {
             --timeout "$timeout_min" \
             --codeunit-timeout 10 \
             --max-iterations "$max_iter" \
-            "${renew_flag[@]}" \
+            ${renew_flag[@]+"${renew_flag[@]}"} \
             --junit-output "$junit_path"
         rc=$?
     fi
@@ -959,13 +962,14 @@ MERGED_JUNIT="$JUNIT_OUTPUT"
 STRICT_COMPLETENESS=0
 [ ${#CHUNKS[@]} -gt 1 ] && STRICT_COMPLETENESS=1
 
+# Empty for a single chunk; guarded like renew_flag for bash 3.2 under set -u.
 STRICT_FLAG=()
 [ "$STRICT_COMPLETENESS" = "1" ] && STRICT_FLAG=(--strict)
 py3 "$REPO_DIR/scripts/merge-junit-batches.py" \
     --out "$MERGED_JUNIT" \
     --expected "$CODEUNIT_IDS" \
     --elapsed "$TOTAL_ELAPSED" \
-    "${STRICT_FLAG[@]}" \
+    ${STRICT_FLAG[@]+"${STRICT_FLAG[@]}"} \
     "${CHUNK_JUNITS[@]}"
 MERGE_RC=$?
 [ "$MERGE_RC" -ne 0 ] && OVERALL_RC=1

@@ -1,5 +1,10 @@
+# Opt-in Mono RDLC renderer (issue #73). Default 0 keeps this image exactly
+# what it has always been: no Mono, no extra ~350 MB, no behaviour change.
+# Build with --build-arg BC_WITH_RDLC=1 to get an image that can render RDLC.
+ARG BC_WITH_RDLC=0
+
 # Build stage: compile StartupHook + stubs + tools
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:8.0 AS builder
+FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:8.0-noble-amd64 AS builder
 
 # gcc needed for compiling Win32 P/Invoke stubs (kernel32_stubs.c → libwin32_stubs.so);
 # unzip for extracting libSkiaSharp.so out of NuGet packages (nupkg = zip)
@@ -9,9 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev u
 # .NET 10 SDK alongside the 8.0 SDK this image ships. BC 27/28 target net8.0,
 # BC 29 targets net10.0, and the framework-impersonating stubs + Cecil reference
 # assemblies have to be produced for BOTH. Deliberately installed on top of the
-# bookworm-based sdk:8.0 image rather than switching the base to sdk:10.0
-# (trixie): libwin32_stubs.so is compiled here with gcc and has to keep running
-# against the bookworm glibc in the aspnet:8.0 runtime stage.
+# noble-based sdk:8.0 image rather than switching the base to sdk:10.0
+# libwin32_stubs.so is compiled here with gcc and has to keep running
+# against the noble glibc in the aspnet:8.0 runtime stage.
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
     bash /tmp/dotnet-install.sh --channel 10.0 --install-dir /usr/share/dotnet && \
     rm /tmp/dotnet-install.sh && \
@@ -49,14 +54,17 @@ RUN cd src/tools/PatchNclTestPage && dotnet publish -c Release -o /build/output/
 # `docker compose exec` instead of `dotnet run`, removing the host-side
 # .NET 8 SDK requirement for running tests against a Linux BC container.
 RUN cd tools/TestRunner && dotnet publish -c Release -o /build/output/tools/TestRunner 2>&1 | tail -3
+RUN cd tools/NavUserPasswordInspector && dotnet publish -c Release -o /build/output/tools/NavUserPasswordInspector 2>&1 | tail -3
+RUN /build/output/tools/NavUserPasswordInspector/NavUserPasswordInspector self-test
 
 # Native libSkiaSharp.so for BC's report renderer, one per SkiaSharp line
-# Microsoft has shipped (BC 28.x = 3.119.0; 2.88.9 covers the 2.88.x line).
+# Microsoft has shipped (BC 28.x = 3.119.0; 2.88.9 covers the 2.88.x line;
+# BC 30.0.57338 insider = 4.152.1).
 # The entrypoint version-matches the artifact's managed SkiaSharp.dll and links
 # the right one (plus the harfbuzz symlink) into the service dir — see the
 # "report rendering natives" step there. nupkgs are plain zips.
 RUN mkdir -p /build/output/skia && \
-    for v in 2.88.9 3.119.0; do \
+    for v in 2.88.9 3.119.0 4.152.1; do \
       curl -fsSL "https://www.nuget.org/api/v2/package/SkiaSharp.NativeAssets.Linux/$v" -o /tmp/skia.nupkg && \
       unzip -j -o /tmp/skia.nupkg "runtimes/linux-x64/native/libSkiaSharp.so" -d /build/output/skia/$v && \
       rm /tmp/skia.nupkg; \
@@ -88,8 +96,32 @@ RUN mkdir -p /build/output/refasm /build/output/refasm-net10 && \
     cp "$REF_DIR10"/*.dll /build/output/refasm-net10/ && \
     echo "Copied $(ls /build/output/refasm/*.dll | wc -l) net8.0 + $(ls /build/output/refasm-net10/*.dll | wc -l) net10.0 reference assemblies"
 
+# ---------------------------------------------------------------- RDLC renderer
+# Two stages selected by BC_WITH_RDLC, so the default build never installs Mono
+# and never runs the renderer build. The runtime stage copies from the alias
+# either way; when disabled it copies an empty directory.
+FROM builder AS rdlc-0
+RUN mkdir -p /build/output/rdlc
+
+FROM builder AS rdlc-1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        mono-devel pkg-config git patch \
+        libpango1.0-dev libfontconfig1-dev libfreetype-dev libharfbuzz-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Only the renderer build inputs, so editing entrypoint.sh does not invalidate
+# this layer and re-run the whole renderer build.
+COPY scripts/build-rdlc.sh scripts/
+COPY prototypes/ prototypes/
+# Cecil patcher for the ReportViewer assemblies. Runs at container start against
+# the BC artifact, so it ships as a tool rather than being applied here.
+RUN cd src/tools/PatchRdlc && dotnet publish -c Release -o /build/output/rdlc/PatchRdlc 2>&1 | tail -3
+RUN SRC=/build bash scripts/build-rdlc.sh /build/output/rdlc
+
+FROM rdlc-${BC_WITH_RDLC} AS rdlc
+
+
 # Runtime stage: minimal image
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/aspnet:8.0
+FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/aspnet:8.0-noble-amd64
 
 # Install tools for artifact download and SQL setup + en_US locale.
 # harfbuzz/freetype/fontconfig/fonts: BC's report renderer text-shapes via native
@@ -106,7 +138,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libharfbuzz0b libfreetype6 fontconfig fonts-liberation && \
     sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen && \
     curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/mssql.list && \
+    echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" > /etc/apt/sources.list.d/mssql.list && \
     ACCEPT_EULA=Y apt-get update && ACCEPT_EULA=Y apt-get install -y --no-install-recommends mssql-tools18 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -121,6 +153,20 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh &&
     rm /tmp/dotnet-install.sh && \
     dotnet --list-runtimes
 
+# Mono and the text/font stack the RDLC renderer needs. Only installed when
+# BC_WITH_RDLC=1 — mono-devel plus the Noto fonts is ~350 MB, and most consumers
+# never render an RDLC layout. mono-devel rather than mono-runtime: the original
+# reporting service pulls in System.Web, System.Data and the 4.5 facades, and
+# the Roslyn shim needs /usr/lib/mono/4.5-api to compile report expressions.
+ARG BC_WITH_RDLC=0
+RUN if [ "$BC_WITH_RDLC" = "1" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends \
+            mono-devel libgdiplus libpango-1.0-0 libpangocairo-1.0-0 \
+            libharfbuzz0b libharfbuzz-subset0 libfontconfig1 libfreetype6 \
+            fonts-noto-core fonts-droid-fallback && \
+        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 RUN mkdir -p /bc/hook /bc/hook-net10 /bc/patched /bc/refasm /bc/refasm-net10 /bc/addins-overlay /bc/testrunner /bc/service /bc/artifacts /bc/scripts /bc/tools
 
 # Copy built artifacts from builder
@@ -134,6 +180,7 @@ COPY --from=builder /build/output/DrawingStub.dll /bc/addins-overlay/System.Draw
 COPY --from=builder /build/output/DrawingStub-net10.dll /bc/addins-overlay/System.Drawing.Common.net10.dll
 COPY --from=builder /build/output/skia/ /bc/natives/skia/
 COPY --from=builder /build/output/otel/ /bc/natives/otel/
+COPY --from=rdlc /build/output/rdlc/ /bc/rdlc/
 
 # Copy scripts
 COPY scripts/ /bc/scripts/

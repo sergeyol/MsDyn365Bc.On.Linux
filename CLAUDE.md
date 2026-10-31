@@ -33,6 +33,8 @@ Multiple parallel instances: use `-p <project>` with a unique port offset for ev
 
 ### Running AL tests
 
+For the full flow (start BC, install the AL compiler, stage symbols, compile, publish, run tests, common errors), use the `bc-linux-run-tests` skill in `.claude/skills/bc-linux-run-tests/SKILL.md`.
+
 ```bash
 # Publish a test app then run a codeunit range (per-method results require --app)
 ./scripts/run-tests.sh --app MyTestApp.app --codeunit-range 50000..50100
@@ -42,6 +44,55 @@ Multiple parallel instances: use `-p <project>` with a unique port offset for ev
 ```
 
 `run-tests.sh` is a hybrid OData (suite population + result reading) + WebSocket (test execution via a real client session) flow. The WebSocket step is required because TestPage support needs a `serviceConnection`-style session, which OData can't provide. The test runner extension is in `extensions/TestRunnerExtension/` (AL source under `src/`); the prebuilt `.app` is baked into the image and republished automatically on container start.
+
+**One client session runs a whole batch, and that is deliberate** (issue #65).
+`tools/TestRunner/Program.cs` used to open a new session before every codeunit,
+on the stated grounds that BC kills the session after each one under test
+isolation. It does not — `TestIsolation = Codeunit` rolls back database changes
+and says nothing about the session, which is why the non-exception path in that
+loop is reached at all. The renewal cost fidelity: `SingleInstance` codeunit
+instances live for the lifetime of the session, so a fresh session per codeunit
+reset state that a real tier carries across test codeunits (BcContainerHelper
+defaults `RenewClientContextBetweenTests` to `$false`). It also cost time.
+Measured on the AL language corpus, 363 codeunits, BC 28.4: **296s → 88s, with
+2712 results either way and exactly two outcome changes**, both `SingleInstance`
+tests that now fail the way a Windows container fails them.
+`--renew-client-context` restores the old behaviour on both `run-tests.sh` and
+`TestRunner.dll`. A session lost mid-run is still recovered — the loop opens a
+new one on the next iteration, which is what it always did.
+
+**The suite is posted in parts and run as one** (issue #74). `CodeunitIds` on
+table 99903 is `Text[2048]`, so a long list still has to be split for the POST.
+It used to be set up and *executed* once per part, because `SetupSuite` cleared
+the suite — so every part was its own `TestRunner.dll` process and its own
+client session, and session state restarted at every part boundary. Page 99902
+now also exposes `setupSuiteAppend`, which adds to the suite without clearing
+it: the first part calls `setupSuite`, the rest call `setupSuiteAppend`, and the
+whole suite runs in one process.
+
+Measured on BC 28.4 with five codeunits forced into five parts
+(`BC_CODEUNIT_IDS_MAX_CHARS=6`), against the same five in one part: master gave
+**6 passed / 0 failed** split and **4 passed / 2 failed** unsplit — the split
+turned two real failures green. Both now report 4 passed / 2 failed. The full
+corpus (363 codeunits, 3 parts) is unchanged at 2712 results, so nothing else
+moved.
+
+`AddTestCodeunit` ignores a codeunit already in the suite, which is what makes a
+part safe to re-post. `--timeout` is scaled by the number of parts, because it
+used to be a per-part budget and is now a whole-run one.
+
+**The runner codeunit can be chosen** (issue #193). The suite runs through page
+130455 with runner 130450 "Test Runner - Isol. Codeunit", BcContainerHelper's
+default. `--test-runner-codeunit <id>` on `run-tests.sh`, and the
+`test_runner_codeunit_id` input on both reusable workflows, set the suite's
+"Test Runner Id" instead (field `TestRunnerId` on table 99903, Test Runner
+Extension 3.3.0.0). That covers 130451 and a test app's own `Subtype =
+TestRunner` codeunit (BcContainerHelper's `-testRunnerCodeunitId`). The hub has
+no runner codeunit, so with the input set `bc-test-from-source.yml` sends every
+codeunit to the websocket runner, and `test_runner=altool` fails. A runner id
+that does not exist fails the run with BC's "An object with that ID does not
+exist". The extension cannot check it earlier: it has no platform dependency,
+so `AllObj` is not visible to it.
 
 **EXPERIMENTAL altool runner (BC 28+ only):** `scripts/run-tests-altool.py` runs tests through the AL dotnet tool's native `al runtests` command (Microsoft.Dynamics.BusinessCentral.Development.Tools, 18.x prerelease — stable 17.x has no `runtests`), which drives the NST's built-in SignalR hub at `/dev/TestRunnerHub`. No TestRunnerExtension, no OData suite, no WebSocket emulation — the server pushes per-method results (status, output, duration) over the hub. Requires the server to advertise Dev API 7.0 (`GET /BC/dev/metadata`), which only exists in BC 28.0+. Caveats: tests do NOT run under an AL test runner codeunit (no AI tests, no test-runner setup/teardown events, isolation from `RequiredTestIsolation`, default Codeunit) — so Microsoft BCApps suites may behave differently than under `run-tests.sh`; the test app must already be published+installed (the script doesn't publish). The reusable workflow's `test_runner` input defaults to `auto`: after BC is healthy it probes `GET /dev/metadata` (via `run-tests-altool.py --probe`, exit 0 = Dev API ≥ 7.0) and uses the altool runner when supported, falling back to the websocket runner otherwise — so 27.x legs and consumers on older versions keep working unchanged. `websocket` forces the legacy flow; `altool` forces the hub and fails hard when unsupported (the regression-detection mode). `altool_version` pins the dotnet tool. Auth comes from `BC_SERVER_USERNAME`/`BC_SERVER_PASSWORD` env vars, which the script sets from `--auth`. The script's stdout deliberately prints the same `N total, P passed, F failed` and `Test codeunits: ...` lines the workflow parser greps — keep that contract if you touch either side.
 
@@ -68,7 +119,7 @@ docker compose build bc && docker compose up -d --wait
 3. **`scripts/entrypoint.sh`** — the long-running orchestration. Steps:
    - **Step 1**: Download BC artifacts (or wait for them if `BC_ARTIFACT_URL=skip`). Cached in the `bc-artifacts` volume.
    - **Step 2**: Copy service tier into `/bc/service/`, replace the Windows Reporting Service PE binary with our Linux .NET stub (`stubs/reporting-service-stub`), symlink `kernel32.dll`/`user32.dll`/etc. → `libwin32_stubs.so`.
-   - **Step 2b**: Apply on-disk binary patches (`CodeAnalysis.dll`, `Mono.Cecil.dll`, `Nav.Ncl.dll` `Assembly.Load`→`LoadFrom`, `TestPageClient.dll` Async fix), copy refasm DLLs, rename `Add-ins` → `Add-Ins` (case-sensitivity fix).
+   - **Step 2b**: Apply on-disk binary patches (`CodeAnalysis.dll`, `Mono.Cecil.dll`, `Nav.Ncl.dll` `Assembly.Load`→`LoadFrom`, `TestPageClient.dll` async fix — opt-in only via `BC_TESTPAGE_ASYNC_PATCH=1` as of issue #78, see `KNOWN-LIMITATIONS.md`), the Windows text patches (CRLF, code page 1252, culture data — see "Windows text behaviour" below, `BC_WINDOWS_TEXT=0` turns them off), copy refasm DLLs, rename `Add-ins` → `Add-Ins` (case-sensitivity fix).
    - **Step 3**: Wait for SQL, restore the demo DB, create BC SQL login.
    - **Step 4**: Start BC, publish the TestRunnerExtension and any apps in `BC_TEST_APPS`, then write `/tmp/bc-ready` (which the healthcheck looks for) and `wait`.
 
@@ -79,7 +130,8 @@ docker compose build bc && docker compose up -d --wait
    - **#1, #2, #4, #5, #13**: kill Windows-identity / event-log / ETW / Watson code paths that throw `PlatformNotSupportedException` and crash boot.
    - **#14, #15, #15a/b**: server-side AL compiler (Cecil) — strip the Windows .NET runtime probing path and fix type-forward resolution so AL extensions actually compile.
    - **#19, #20**: Reporting Service. The Windows PE binary is replaced with `stubs/reporting-service-stub` (Linux .NET), and `CustomReportingServiceClient` is swapped for a no-op so the watchdog stops flooding the log.
-   - **#21**: `NavOpenTaskPageAction.ShowForm` no-op — without it, a single test that opens a task page kills the entire test session.
+   - **#21**: `NavOpenTaskPageAction.ShowForm` — re-implements the real body so a task-page open actually shows the form and the test's `[PageHandler]` / `[ModalPageHandler]` runs. It used to be an unconditional no-op, which kept the session alive but meant the page was built and never shown: no handler was looked up, no error was raised, and the invoke returned normally, so a test could not tell "the page opened" from "nothing happened". That covers every action `RunObject`, the Edit/View/ViewList/OpenInNewWindow menu actions, the built-in New action and page views. A `NullReferenceException` escaping the show call is logged with its full stack and reported as "not shown" rather than killing the session. `BC_SHOWFORM_MODE=skip` restores the old no-op; `BC_SHOWFORM_TRACE=1` logs every call and how it ended.
+   - **#32, #32b**: `NavLicense.Dispose(bool)` and `NavDatabaseSecurityAndLicense.Dispose(bool)` no-op'd. A `NavDatabase` teardown concurrent with a running session used to hand that session a `NullReferenceException` from inside Microsoft's `BclLicenseDataReader` (whose `Dispose` is `reader = null` and whose readers are unguarded), or an `ObjectDisposedException` from the `licenseLock`. Both bodies are pure GC bookkeeping. This is the single biggest source of *random* one-test red legs, because the altool `cli` transport starts a fresh session per codeunit — see KNOWN-LIMITATIONS.md.
 
 5. **`extensions/TestRunnerExtension/`** — AL extension (`src/*.al`) exposing the OData/WebSocket pages used by `run-tests.sh`. The compiled `.app` lives in the same dir and is copied into the image at build time (`extensions/TestRunnerExtension/TestRunnerExtension.app` → `/bc/testrunner/TestRunner.app`).
 
@@ -95,8 +147,11 @@ docker compose build bc && docker compose up -d --wait
 ### Known limitations (see `KNOWN-LIMITATIONS.md`)
 
 - ~142 test failures from "User cannot be deleted because logged on" — Microsoft test cleanup deletes the session user; only fixable by patching the platform "user is logged on" check.
-- ~29+ failures from `NSClientCallback.CreateDotNetHandle` NullRef on tests that need a UI session (Camera, Barcode, etc.).
+- ~~~29+ failures from `NSClientCallback.CreateDotNetHandle` NullRef on tests that need a UI session (Camera, Barcode, etc.).~~ Fixed (issue #125): both test runners' clients answered `CreateDotNetHandle` with null. They now answer as the web server's `ObservingAutomationHandler` does — a handle for a client extension type, `IsAvailable` false — in `tools/TestRunner` and Patch #37.
 - Bucket 4 sequential test run previously crashed the container after Tests-Misc due to infinite recursion in Microsoft's `OfficeWordDocumentPictureMerger.ReplaceMissingImageWithTransparentImage` (stack overflow in `Nav.OpenXml`, triggered by `TestSendToEMailAndPDFVendor`). **Fixed by Patch #23** — `ReplaceMissingImageWithTransparentImage` is no-op'd via JMP hook so missing images are left in place and the session survives.
+
+- Platform-table captions (All Profile, User, Company, …) came back in Traditional Chinese inside English error messages (issue #52). Not a session-language problem: on Linux/ICU `CultureInfo.GetCultures` never yields plain `zh-TW`, so BC's `LanguageHelper` had no "CHT" entry and the CaptionML parser filed the Chinese text under the English LCID, first in line. **Fixed by Patch #31** (rebuilds the abbreviation table with the ICU-hidden cultures); `extensions/smoke-test` carries a regression guard. Details in `KNOWN-LIMITATIONS.md`.
+  The Windows Language table (2000000045) had the same cause (issue #198): BC 27/28 had no 1028, BC 29 no 3076/4100/5124, and ICU's `zh-Hant` (31748) held "ZHH". The patcher's `windowslanguages` command adds zh-TW/HK/SG/MO to the `CultureInfo.GetCultures` call in `WindowsLanguageHelper.GetDistinctCultures`, and the `LCIDToLocaleName` stub now answers a size query, which BC 27/28 ask before adding a language group's primary culture (BC 29 skips the question off Windows). Both versions then list the same 214 cultures. Not a JMP hook: `GetDistinctCultures` is small enough to be inlined.
 
 When adding a new patch, append it to the numbered list in the `StartupHook.cs` header comment AND `KNOWN-LIMITATIONS.md` if it closes a known failure mode.
 
@@ -253,7 +308,7 @@ hardened. Don't undo them without understanding why they exist.
   row even when the test app's metadata isn't loaded; only Function
   rows prove that real `[Test]` procedures are enumerable.
 - **`build-image.yml`'s `IMAGE_NAME` MUST match what consumers pull**
-  (`stefanmaron/msdyn365bc.on.linux/bc-runner`). In an earlier state
+  (`aldevtools/msdyn365bc.on.linux/bc-runner`). In an earlier state
   it was `stefanmaron/bc-runner` and every entrypoint fix went into
   an image namespace nobody used. The mismatch was invisible for
   weeks. Don't move this without auditing every consumer's
@@ -601,6 +656,20 @@ AL call stack in the body. Skipped tests use `<skipped/>`.
 
 ### Things not to break
 
+- **The altool hub's empty-name result is a rollup, not a test.** BC's
+  TestRunnerHub emits one extra result per codeunit with an empty method
+  name (`  PASS  (656ms)` / `  FAIL  (876ms)`). `run-tests-altool.py`
+  drops the PASS form, keeps the FAIL form as `(codeunit)` so a real
+  codeunit-level failure (an OnRun error, a failed codeunit-level setup)
+  cannot vanish — and then **drops that too when a named `[Test]` in the
+  same codeunit already failed** (`CodeunitRun.drop_redundant_codeunit_result`).
+  Without that last step one real failure is reported as two, the JUnit
+  file carries a phantom `(codeunit)` case whose AL call stack points at
+  whichever test ran last (often a passing one), and the altool and
+  websocket runners disagree about the same run — the websocket leg
+  reports 1. Don't "simplify" this back to keeping every empty-name row,
+  and don't drop them unconditionally either; both directions have bitten.
+
 - **`Test Method Line.Name` on Function rows is the function name, not
   the codeunit name.** I expected the table to expose the codeunit name
   on Function rows (since the parent record carries it), but BC stores
@@ -639,19 +708,42 @@ correctness gaps trace back to that:
    modal page call (`asserterror ... .Invoke(); Assert.ExpectedError
    ('Unhandled UI')`) doesn't get that error under the hub — the call
    just silently returns.
-2. **Cross-codeunit `SingleInstance` state leakage under `--transport
-   hub`/`auto`.** Tests asserting that a `SingleInstance` codeunit's state
-   resets at the per-test-codeunit isolation boundary
-   (`RequiredTestIsolation = Codeunit`, the AL default) fail under one
-   persistent hub connection for a whole run and pass under websocket —
-   the hub apparently doesn't tear down and recreate the isolation scope
-   per codeunit the way a fresh session does. This is unrelated to
-   `[HandlerFunctions]` and isn't visible from any one codeunit's own
-   source.
+2. **`TestPermissions` is never applied** (issue #64). The property "works
+   together with the OnBeforeTestRun and OnAfterTestRun triggers in test
+   runner codeunits" — its own documentation — so with no test runner
+   codeunit the permission execution context is never switched and every
+   test on the hub runs as SUPER. Both non-`Disabled` values are affected:
+   `Restrictive` (the default when the property is absent) and
+   `NonRestrictive` both set the context to 'D365 Full Access', which does
+   not cover an extension's own tables. Measured on BC 28.4, one container:
+   a test codeunit with no `TestPermissions` declaration inserting into its
+   own table is refused by the websocket runner ("Sorry, the current
+   permissions prevented the action.") and succeeds on the hub. At corpus
+   scale that was 652 refusals the fast path silently turned green, against
+   659 the same corpus produced on a Windows container.
+
+There was a third entry here, and **the diagnosis in it was backwards** —
+worth knowing because it is what made two runners agree on the wrong answer.
+It claimed that cross-codeunit `SingleInstance` state leaked under
+`--transport hub` and that websocket was correct to reset it. `SingleInstance`
+instances live for the lifetime of the SESSION; `TestIsolation = Codeunit`
+rolls back DATABASE changes and says nothing about the session, and real BC
+runs a suite in one client session (BcContainerHelper defaults
+`RenewClientContextBetweenTests` to `$false`). So the hub was the only one of
+the three transports that matched a Windows container and a SaaS sandbox. The
+websocket runner has stopped renewing its session per codeunit and now agrees
+too — see issue #65 and `tools/TestRunner/Program.cs`.
+
+**Neither leg is faithful across the board**: the hub gets `SingleInstance`
+lifetime right and `TestPermissions` wrong; the websocket runner gets both
+right, at ~3x the wall time on the corpus. That asymmetry is the reason the
+split exists and the reason routing errs toward websocket.
 
 `scripts/classify-handler-codeunits.py` statically scans a test app's AL
-source for `[HandlerFunctions(...)]` usage (and the specific unhandled-
-modal-plus-`asserterror` shape) and routes each codeunit to either the fast
+source for `[HandlerFunctions(...)]` usage (the specific unhandled-
+modal-plus-`asserterror` shape, any test body that names the `Unhandled UI`
+error text — issue #93, a Confirm in a part's `OnOpenPage` with no call to
+match on — and any effective `TestPermissions` other than `Disabled`) and routes each codeunit to either the fast
 path or the classic websocket path — decided ONCE, before either runner
 starts, so nothing runs twice even when many codeunits fail. It's a
 heuristic tied to the *known* failure shape, not a proof of full
@@ -663,21 +755,70 @@ cannot recover attribute usage from a compiled `.app` — checked empirically,
 `scripts/run-tests-hybrid.py` is the orchestrator: discovers the full test
 codeunit set from the `.app` (same `SymbolReference.json` discovery
 `run-tests-altool.py` already does), classifies via the AL source dir,
-runs both legs **concurrently** (different BC endpoints, no shared-resource
-conflict), and merges JUnit + summary counts into one report. Codeunits
+runs the two legs **one after the other, altool first**, and merges JUnit +
+summary counts into one report. They used to run concurrently, justified as
+"different BC endpoints, no shared-resource conflict" — the endpoints do
+differ, but the legs share one service tier, tenant, company and set of
+application metadata, and a client session holding a page open dies with
+"The page definition has changed while opening the page" when the metadata
+generation moves under it. Five instances in the 18 most recent failed runs
+of the corpus that consumes this workflow, all on 28.x legs (where the
+second leg exists) and none on 27.x. See `run_legs` in the script for the
+full evidence, and StefanMaron/BusinessCentral.AL.Language.Tests#158.
+Altool goes first because the websocket leg republishes the app, which is
+the only metadata-mutating action either leg performs; last is where it does
+the least harm. Codeunits
 with no matching AL source are conservatively routed to websocket —
 unproven safety is treated as unsafe.
 
-**The fast leg defaults to `--altool-transport cli`, not `hub`/`auto`**,
-even though hub is ~40x faster per codeunit. `cli` spawns a fresh
-`al runtests` process — a fresh connection — per codeunit, which is the
-same per-codeunit isolation shape `run-tests.sh` already gets from its own
-reconnect-before-every-codeunit design, and is the plausible reason `cli`
-doesn't show the `SingleInstance` leak that `hub` does (per the issue's
-diagnosis; not independently re-verified here). Don't change this default
-back to `hub`/`auto` without first confirming `cli` is actually clean of
-gap #2 above — the whole point of this design is that a wrong assumption
-here fails silently, the same way the original bug did.
+**The fast leg defaults to `--altool-transport auto`** (one persistent hub
+connection for the whole leg; `cli` only if the hub cannot be reached). It
+defaulted to `cli` so that a codeunit that kills its session costs only that
+codeunit, but the hub transport reconnects and retries the interrupted
+codeunit once, and `cli` paid about 0.76 s per codeunit for process start,
+login and SignalR negotiation. In the corpus repository's BC 29.0 job that was
+813 s of a 1,660 s leg (1,070 codeunits), in a test step that was at its 30
+minute limit (issue #115). The `SingleInstance` argument that used to be given
+for `cli` is contradicted by the measurement above: `cli`'s fresh session per
+codeunit is in fact the LESS faithful of the two on that surface, so a
+corpus test that depended on it may now fail the way a Windows container fails
+it. The reusable workflow exposes the choice as `altool_transport`.
+
+A fifth shape routes to websocket (issue #120): a test that calls `NumberSequence.` and also
+uses `asserterror`. SQL Server rolls the whole transaction back when `CREATE SEQUENCE` hits an
+existing name (`XACT_ABORT` is OFF; reproduced with plain `sqlcmd`). On the hub's reused session
+the test scope then finds no transaction when `asserterror` rolls back to its savepoint, and the
+test fails with "Transaction was rolled back by the server." A fresh session (the `cli`
+transport), the websocket runner and a Windows container give the AL error. Measured on BC 29.0:
+`74214|74217` fails, `74217` alone passes. The root cause inside the hub is not found; the
+routing is the workaround, and only five corpus codeunits move.
+
+A sixth shape routes to websocket (issue #140): a test body that names one of Microsoft's test
+runner codeunits ("Test Runner - Mgt.", "Test Runner - Isol. ..."). Errors such as
+"You tried to invoke the Table object with the ID n from the object X" name the caller of the
+test method. On Windows and on the websocket runner that is "Test Runner - Mgt."; the hub has
+no AL caller, so BC names the test codeunit. Faking a caller inside BC's error path on the hub
+would be inventing an object name, so the test is routed instead. Corpus tests that pinned
+the hub's text under `#if BC28PLUS` (`report/lt-t-validate-layout`, codeunit 69366) now get the
+Windows text on 28+ and need that branch removed.
+
+The hub's file answers are Patch #36, not routing: `ExportDataAction` reads the export stream
+and returns true (issue #138), `UploadFileAction` refuses with
+`NavNotSupportedFileDialogProviderException` (issue #141), the same answers the websocket
+runner gives. `extensions/smoke-test` codeunits 70012, 70020 and 70023 guard all of this and
+are in `test-versions.yml`'s codeunit range.
+
+**Unhandled UI on the hub is Patch #38 (issue #139).** The cause of gap 1 above was one line
+in Microsoft's hub, not the missing AL test runner: `TestRunnerRuntime.InitializeRuntime`
+(Nav.Service.Dev) sets `TestExecution.SuppressUnhandledUI = true`, and
+`NavTestExecution.FindHandler` never raises `MissingUIHandler` while it is set. Patch #38 sets
+it back to false before every test method, from Patch #34's hook on `DevTestRunnerCodeunit`.
+It is reset through the property's setter by reflection; a JMP hook on the auto-property
+would not hold, because the JIT inlines trivial accessors from IL. Smoke-test codeunit 70027
+checks Confirm, Message, StrMenu and a part's Confirm on the hub with the expected texts in
+codeunit-level labels, so the classifier does not route it away. The "names Unhandled UI"
+routing rule is kept: the hub now raises the error, but a test that names it still runs on
+the runner that has been checked against Windows the longest.
 
 `test_runner=altool` (explicit force, BC 27/28's "catch hub regressions"
 mode) is untouched by any of this — it still runs every codeunit through
@@ -767,6 +908,130 @@ GitHub secrets block.
 - When adding any further file imports via OPENROWSET BULK, remember
   the sql-container mount requirement (see "CRITICAL" above).
 
+## The tier creates its own encryption key
+
+AL's `ENCRYPT`/`DECRYPT`, `IsolatedStorage(Encrypted = true)` and the Data
+Encryption Management pages all read one RSA key that belongs to the tenant.
+**Business Central never creates that key on its own.** On Windows it is an
+explicit setup step (`New-NAVEncryptionKey`, or the Enable Encryption action on
+page 9905); a Business Central online tenant is handed one by the service. This
+container had neither, so every AL encryption call failed with "An encryption
+key is required to complete the request." That was BC behaving correctly, and a
+permanent difference from the sandbox this image is meant to match — issue #75.
+
+Two halves, and both are needed:
+
+- **`scripts/entrypoint.sh` keys the tenant-property row** (issue #66) and
+  symlinks the server's `Keys` directory onto the `/bc/service` volume, so the
+  key file and the file name recorded in `[$ndo$tenantproperty]` survive a
+  container recreate together. A key file without its recorded name, or a name
+  without its file, both fail — the second one worse, with
+  `NavEncryptionKeyNotFoundException` instead of "no key".
+- **`extensions/TestRunnerExtension/src/EncryptionKeyBootstrap.Codeunit.al`
+  creates the key**, through BC's own `CreateEncryptionKey()`. It runs from an
+  install codeunit (`OnInstallAppPerDatabase`) and an upgrade codeunit. The SQL
+  data lives on a tmpfs, so the database is restored fresh on every container
+  start and this extension is installed again each time — which is exactly when
+  a new tenant needs a key. The entrypoint then reads the recorded file name
+  back and logs it, so a tier without a key says so at boot instead of surfacing
+  in the first AL test that encrypts.
+
+Three things not to change without knowing why they are that way:
+
+- **The install trigger uses a `[TryFunction]`, not `Codeunit.Run`.**
+  `Codeunit.Run` opens a nested transaction, and creating a key inside one fails
+  the whole install with "An error occurred and the transaction is stopped" —
+  measured on BC 28.4, where the identical calls made directly succeed. The
+  guard is still needed: an install trigger that raises fails the publish, and
+  the test runner matters more than the key.
+- **The key setup lives in the test runner extension** because that is the one
+  extension the entrypoint publishes on every boot. A separate app would add
+  another publish to every startup.
+- **`CreateEncryptionKey()`'s Boolean return is what keeps a failure quiet.**
+  Called without it, a failed creation raises.
+
+Patch #26 (`BC_FAKE_ENCRYPTION=1`) is the pass-through proxy that used to stand
+in for all of this. It is opt-in and should stay that way — see
+`KNOWN-LIMITATIONS.md` for why its stated reason was wrong.
+
+## Windows text behaviour: rewritten in BC's IL (issue #113)
+
+A corpus run on an official Windows container disagreed with this tier on 219 tests, and
+almost all of them trace to a few values .NET bakes into CoreLib's precompiled code:
+`Environment.NewLine` (LF here, CRLF there) and `Encoding.GetEncoding(0)` (UTF-8 here, the
+ANSI code page there). No runtime hook reaches a constant inside R2R code, but the BC call
+sites are ordinary IL, so `src/tools/PatchNclTestPage` rewrites them on disk in Step 2b of
+`entrypoint.sh`. Four commands, each idempotent, applied to `Nav.Ncl.dll` and `Nav.Types.dll`
+(`newline` also to `YamlDotNet.dll`):
+
+| command | what it changes |
+|---|---|
+| `newline` | `Environment.NewLine` → CRLF; `StringBuilder.AppendLine`; `new XmlWriterSettings`, `StreamWriter`, `StringWriter` get `NewLine`/`NewLineChars` CRLF; `new XmlTextWriter(path, enc)` and `XDocument.Save(Stream, SaveOptions)` go through a helper |
+| `encoding` | every `Encoding.GetEncoding(int)` → a helper that treats 0 as 1252 |
+| `uri` | `new Uri(string)` in `NavHttpRequestMessage` / `NavHttpClient` refuses a leading `/` |
+| `culture` | every `CultureInfo.GetCultureInfo(...)` and `new CultureInfo(...)` result goes through `BcLinuxCulture` (U+202F → plain space, da-DK short date, de-DE/es-ES month abbreviations — issue #134; the da-DK time separator, es-ES/nl-NL short dates, en-GB/sv-SE long dates and sv-SE/nb-NO minus sign — issue #157); the "Time Zone" table's `GetSystemTimeZones()` call returns `BcLinuxTimeZones`' 144 Windows zones (issue #132) |
+
+Not text, but in the same Step 2b block: `filetable` (issue #199). The File virtual table's Path field is Code[98], so BC upper-cases `/tmp/x/` to `/TMP/X/`; NTFS ignores the case, Linux did not, and the table was empty. `new DirectoryInfo` in `FileDataProvider.GetItemsInTheDirectory` and `Path.Combine` in `GetBlobContent` go through `BcLinuxFileTable`, which finds each folder part ignoring case. The Path field keeps the upper-cased value, as on Windows. Smoke codeunit 70077 guards it.
+
+The OEM half of `TextEncoding::MSDos` lives in `src/StartupHook/kernel32_stubs.c`
+(`OemToCharBuffA` / `CharToOemBuffA`): code page 437 ↔ 1252 tables. BC builds its own MSDos
+tables from them once, with a pairing fix-up (`NCLManagedAdapter.Initialize`), so the stub
+supplies the base tables, not the final ones. The three control-glyph pairs in it
+(`0x14`↔`0xB6`, `0x15`↔`0xA7`, `0x0F`↔`0xA4`) are what makes the fix-up reproduce Windows'
+results; see `KNOWN-LIMITATIONS.md`. `BC_WINDOWS_TEXT=0` turns all of it off.
+
+Things that bit, so they stay fixed:
+
+- **The service-volume stamp must cover the patcher.** It used to hash only `StartupHook.dll`,
+  so a change to `PatchNclTestPage` alone (new patch, new flag) left a warm `/bc/service`
+  volume holding the DLLs the previous patcher wrote, and the new patch silently never ran.
+  The stamp is `v2` and includes the patcher's size/mtime and `BC_WINDOWS_TEXT`.
+- **Inserting an instruction can break a short branch, and nothing says so.** Cecil writes the
+  truncated one-byte offset, the branch lands on the wrong instruction, and the NST dies on
+  its first JIT of that method with `InvalidProgramException` (here in
+  `WindowsLanguageHelper`'s static constructor). Every patch that grows a method calls
+  `IlHelpers.LengthenShortBranches`. **Run `scripts/verify-patched-il.sh <service-dir>` after
+  touching a patch**: it patches a copy and diffs `ilverify` output against the originals
+  (Microsoft's own assemblies already report ~650 errors, only the difference counts). It
+  takes a few minutes and finds in seconds what a boot finds after ten.
+- **A branch that targets the instruction you rewrite must still land on the first
+  instruction of the replacement.** Rewrite the call in place and insert after it, or insert
+  before it and retarget. `InsertBefore` alone moves the instruction a branch pointed at.
+- **`BcLinuxCulture.cs` is source, not a library.** `PatchCulture` reads the patcher's own DLL
+  with Cecil and copies every method of that class into the target assembly. So it may call
+  only framework APIs and may not use lambdas, closures, static fields or try/catch (nothing
+  a plain IL copy carries over). The cache for the fixed cultures lives in
+  `AppDomain.GetData` because of that. Methods other than the root are copied as
+  `<Class>_<Name>`. `BcLinuxTimeZones.cs` follows the same rules. Two traps a plain C#
+  reading misses: an `int[]` (or any primitive array) initializer and a `switch` on a string
+  both compile to helpers outside the class, so the data is string arrays and the
+  comparisons are `string.Equals` chains.
+- **The time zone list and the month names are Windows data, measured, not derived.** The
+  zones come from .NET in `mcr.microsoft.com/windows/servercore:ltsc2025` 10.0.26100.33650,
+  the OS build of the official BC containers; the month names from NLS on Windows Server
+  2025, and only the cultures a BC Windows run confirmed (de-DE, es-ES) are set. Don't
+  generate either from ICU or from `TryConvertIanaIdToWindowsId`: CLDR's Windows mapping has
+  no display names and does not follow a Windows build's set of zones.
+- **Use the raw xunit XML as the Windows reference, not the corpus's `failures.tsv`.** The
+  TSV flattens whitespace and control characters, which is exactly what this issue is about:
+  a U+202F in a Windows message shows as a plain space there and the two sides look
+  identical. Compare messages exactly, not after collapsing whitespace.
+- **The corpus pins Linux values, so a fix turns a passing test red.** "Same message as the
+  Windows container" is the success criterion, and the corpus tests need updating when this
+  lands there. Compile the corpus with `preprocessorSymbols` `BC27PLUS,BC28PLUS` or the
+  version-gated tests are missing from the run, and with the compiler CI uses
+  (`scripts/install-al-compiler.sh 29.0`).
+
+- **The process default culture is fixed in the startup hook too (issue #120).** The IL rewrites
+  only reach cultures BC builds itself. Work BC runs on a pool thread without setting a culture
+  (`Query.SaveAsCsv` formats with `DateTime.ToString(CultureInfo.CurrentCulture)`) used the
+  process default, ICU en-US from `LANG=en_US.UTF-8`, so U+202F was still written before AM/PM.
+  `StartupHook.ApplyWindowsDefaultCulture` sets `DefaultThreadCurrentCulture` to a clone with
+  plain spaces; `BC_WINDOWS_TEXT=0` turns it off. `extensions/smoke-test` has a CSV guard.
+
+What is not fixed (collation, the `SystemId` version nibbles, default decimal places) is in
+the table at the top of `KNOWN-LIMITATIONS.md` with what is known about each.
+
 ## Web client on Linux (PoC, opt-in)
 
 `BC_WEBCLIENT=1 docker compose up -d --wait` self-hosts Microsoft's real
@@ -812,11 +1077,11 @@ The fix is **additive, not a migration**: the image installs both shared
 frameworks side by side and picks per BC version at boot. Nothing about the
 .NET 8 path changed.
 
-- **`src/Dockerfile`** — the builder stays on the bookworm-based `sdk:8.0`
+- **`src/Dockerfile`** — the builder stays on the noble-based `sdk:8.0-noble-amd64`
   and adds the .NET 10 SDK via `dotnet-install.sh`. Do **not** switch the
   base to `sdk:10.0`: that image is trixie, and `libwin32_stubs.so` is
-  compiled here with gcc and has to keep running against the bookworm glibc
-  in the `aspnet:8.0` runtime stage. The runtime stage adds the .NET 10
+  compiled here with gcc and has to keep running against the noble glibc
+  in the `aspnet:8.0-noble-amd64` runtime stage. The runtime stage adds the .NET 10
   ASP.NET Core runtime the same way (which brings `Microsoft.NETCore.App`
   10 with it). A net8.0 app does **not** roll forward to 10 while 8 is
   installed, so BC 27/28 keep resolving 8.0.
@@ -878,7 +1143,10 @@ itself, not .NET 10 problems:
   version — a no-op on 27/28, which never reach it.
 - **`SecurityIdentifier` equality operators** — BC 29 calls
   `op_Inequality`, which `WindowsPrincipalStub` didn't define
-  (`MissingMethodException`). Added; purely additive for 27/28.
+  (`MissingMethodException`). Added; purely additive for 27/28. Since issue #137 the stub's
+  `SecurityIdentifier` is a real SID (parse, `BinaryLength`, `IsAccountSid`, binary form),
+  checked against .NET on Windows; invalid text now throws as it does there. The
+  `WellKnownSidType` enum has the real names and values (`NetworkSid` was 6, is 9).
 
 - **A JMP hook must never be applied twice to the same method.** This is what
   segfaulted BC 29, and it is the single most important thing in this
@@ -914,6 +1182,67 @@ tool to reach for next time BC swallows an assembly load failure: it logs
 every `AssemblyLoadContext.Default.Resolving` and
 `AppDomain.AssemblyResolve` miss with the requesting assembly. Much cheaper
 than `BC_DEBUG_FIRSTCHANCE=1`. Both are docker-compose pass-throughs.
+
+## RDLC rendering (opt-in, `feat/native-rdlc-pdf`)
+
+RDLC works on Linux. It is off by default and costs nothing when off.
+
+```bash
+BC_WITH_RDLC=1 docker compose build bc
+BC_RDLC_RENDERER=mono BC_RDLC_TRUST_LAYOUTS=1 docker compose up -d --wait
+```
+
+Microsoft's own `Microsoft.ReportViewer.Common.dll` runs under Mono with its
+Windows text and font stack (Uniscribe, GDI metrics) replaced by a
+Pango/HarfBuzz/FreeType bridge injected with Cecil, and Microsoft's own
+`Reporting.Service.exe` serves the NST over its real gRPC endpoints. Nothing is
+reimplemented and no third-party renderer is used. `prototypes/rdlc/README.md`
+is the map; `docs/RDLC-ON-LINUX.md` is the older investigation it supersedes.
+
+Things to know before touching it:
+
+- **`BC_WITH_RDLC` builds it, `BC_RDLC_RENDERER` turns it on.** Two switches on
+  purpose: the build arg costs ~350 MB of Mono and fonts in the image, so the
+  default image stays exactly what it was. Setting the runtime var without the
+  build arg logs a clear message and changes nothing.
+- **The ReportViewer patches are pinned to assembly MVIDs.** A BC build whose
+  ReportViewer the patcher does not recognise disables the renderer and leaves
+  the tier as it would have been. That fallback is deliberate — this is opt-in
+  and must never be able to fail a boot. It also means a new BC version needs
+  `src/tools/PatchRdlc/Program.cs` re-pointed before RDLC works there.
+- **Patch #18 stays applied.** We supervise the reporting process ourselves
+  (`NativeRdlcService` + `scripts/start-rdlc-service.sh`); BC's Windows
+  side-service lifecycle stays disabled. Patch #19's no-op client is replaced
+  by #19a, which hands BC its own real gRPC client.
+- **BC 29 talks HTTP, not gRPC (issue #143).** The BC 29 reporting service is
+  an ASP.NET Core host; it must be started with `--PortNumber 0` (Kestrel —
+  any other port selects Windows-only HTTP.sys) and announces its port on
+  stdout. `NativeRdlcService` switches to that mode when
+  `NavEnvironment.CustomReportingServiceClient` is missing, and hooks
+  `NavSession.InitReportingClientAsync` and
+  `ReportingProcessStartup.GetReportingServiceHostUrl`. Details in
+  `prototypes/rdlc/README.md`.
+- **Word and Excel need Microsoft's System.IO.Packaging (issue #144).** Mono's
+  WindowsBase cannot write a new Open XML package. `PatchRdlc` retargets
+  ReportViewer's Packaging types to the NuGet `netstandard2.0` build (not
+  `net462`, which forwards back to WindowsBase).
+- **`libgrpc_csharp_ext.x64.so` is needed by BOTH processes** — the reporting
+  service is the gRPC server and the NST is the client, and Grpc.Core looks for
+  the native next to each process's base directory. Staging it only into
+  SideServices produces a retry loop in the NST.
+- **`/run/bc-rdlc/service.log` is where render failures actually say what
+  happened.** BC maps all of them to "an internal error while rendering the
+  report", and Mono's `StackTrace.AddFrames` throws inside BC's exception
+  telemetry. `BC_RDLC_TRACE=1` adds Mono's exception trace.
+- **It runs as root, and Mono is not a CAS sandbox.** `BC_RDLC_TRUST_LAYOUTS=1`
+  is a required acknowledgement that an RDLC layout's embedded VB runs with the
+  renderer process's privileges. Do not remove that interlock.
+
+Not done: non-root operation (ReportViewer's
+`RevertImpersonationContext.Impersonate` fails as a normal user), per-run
+Unicode font fallback for mixed Arabic/Latin, and searchable RTL text — that
+last one is Microsoft's own `PDFWriter.MapGlyphToUnicodeChar`, which excludes
+RTL runs by design, not a bridge defect. Printing is out of scope.
 
 ## Relationship to `PipelinePerformanceComparison`
 
@@ -972,7 +1301,7 @@ The bc-linux project ships **three** reusable workflows in
   wait-for-bc-healthy.sh) for free.
 
 `build-image.yml` builds and publishes the bc-runner image to
-`ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner` on every push
+`ghcr.io/aldevtools/msdyn365bc.on.linux/bc-runner` on every push
 to master that touches `src/`, `scripts/`, or `extensions/`, tagging
 `:latest` and `:<sha>`. It caches layers to the registry `:cache` tag;
 `test-versions.yml`'s build job caches to `type=gha` instead, because
@@ -1012,18 +1341,39 @@ Trigger `test-versions` manually with a `versions: "27.0,28.1"`
 input to test specific versions — that input short-circuits discovery
 entirely, including the preview legs.
 
+### Image and repository names are not hardcoded in the reusable workflows (issue #83)
+
+`bc-test-from-source.yml`, `bc-test-prebuilt.yml` and `bcapps-gate.yml` default
+their `runner_image` input to the empty string. The job passes
+`inputs.runner_image`, else `ghcr.io/<vars.IMAGE_NAMESPACE>/bc-runner:latest`,
+else nothing, and `docker-compose.yml`'s `${BC_RUNNER_IMAGE:-<default>}` supplies
+the literal (`:-` treats empty and unset alike, the same way `sql_image` already
+works). That compose default and the examples are the only places that carry the
+path. Both reusable workflows also read the checkout `repository:` from the
+`BC_LINUX_REPOSITORY` variable, falling back to `aldevtools/MsDyn365Bc.On.Linux`.
+
+Two things to know. In a reusable workflow `vars` is the **caller's** repository
+variables, so a consumer sets `IMAGE_NAMESPACE` and `BC_LINUX_REPOSITORY` in its
+own repo, not here. And the fallback is deliberate: an earlier version of the
+issue asked the workflow to fail when the variable is unset, which would break
+every consumer (bc-copilot-blueprint, the corpus) until each one set it.
+`build-image.yml`'s `IMAGE_NAME` and `mirror-sql-image.yml`'s mirror paths are
+this repository's own publishing targets and still name the owner.
+
 ### The version matrix is discovered at run time, not hardcoded
 
 `scripts/discover-bc-versions.py` reads Microsoft's artifact indexes and
 emits two matrices:
 
-- **Released (REQUIRED).** Public sandbox index, newest `majors_back`
-  majors (dispatch input, default **2** → 27 and 28 as of 2026-08).
+- **Released (REQUIRED).** Public sandbox index, every major from
+  `min_major` up (dispatch input, default **27** → 27, 28 and 29 as of
+  2026-10; a newly released major joins by itself).
   Emitted as SHORT versions ("27.5", "28.3") on purpose:
   `download-artifacts.sh` resolves a short version to the newest build
   itself, so a hotfix landing between matrix computation and download is
-  picked up rather than missed. Capping at 2 majors is a cost decision —
-  the index carries every major back to 25 and one leg is a full BC boot.
+  picked up rather than missed. The floor is a cost decision — the index
+  carries every major back to 24 and lower, and one leg is a full BC boot.
+  Raise `min_major` when an old major is no longer supported.
 - **Preview (NON-BLOCKING).** Insider index
   (`bcinsider-fvh2ekdjecfjd6gk.b02.azurefd.net`, anonymously readable, no
   SAS token, same path shape as the public one). Two legs only: the next
@@ -1037,7 +1387,6 @@ knob lives in `bc-test-from-source.yml` as a `continue_on_error` input
 (default false) applied to the job it actually runs. Don't try to move it
 back to the caller — it silently does nothing there.
 
-**The next-major preview leg is expected to fail** until the image ships
-.NET 10: BC 29 targets .NET 10, `src/Dockerfile` ships the .NET 8 runtime,
-so the NST cannot start. `preview-note` writes that framing into the run
-summary so a red preview leg isn't misread as a regression.
+**BC 29 was released (it is a required leg as of 2026-10).** The image ships
+both .NET 8 and .NET 10, so the old "next-major preview leg is expected to
+fail" framing no longer applies and `preview-note` no longer says it.

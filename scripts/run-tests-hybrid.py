@@ -20,27 +20,56 @@ the websocket runner (unproven safety == unsafe) and this script behaves
 like a slower version of run-tests.sh — pass --al-source-dir to get the
 speedup.
 
-Both underlying runners are invoked concurrently (they hit different BC
-endpoints — the dev-endpoint hub vs the client-session websocket — so
-there's no shared-resource conflict), each restricted to its own codeunit
-subset via --codeunit-range with an explicit id list.
+The two runners are invoked ONE AFTER THE OTHER, altool first, each
+restricted to its own codeunit subset via --codeunit-range with an explicit
+id list. They used to run concurrently on two threads, justified as "they
+hit different BC endpoints, so there's no shared-resource conflict". The
+endpoints do differ; what they share is the whole of the rest of it — one
+service tier, one tenant, one company, and one set of APPLICATION METADATA.
+That last one is the resource that was in conflict, and it produced a real
+flake: see StefanMaron/BusinessCentral.AL.Language.Tests#158 and the
+comment on run_legs below for the evidence.
 
-The altool leg defaults to --altool-transport cli, NOT hub/auto, even
-though hub is ~40x faster per codeunit. Per
-https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/27#issuecomment-5239717306:
-tests asserting that a SingleInstance codeunit's state resets at the
-per-test-codeunit isolation boundary (RequiredTestIsolation = Codeunit, the
-AL default) fail under --transport hub and pass under websocket, on
-codeunits with no [HandlerFunctions] at all — so this is a second,
-independent hub-transport bug that the static classification above cannot
-see (it's about state leaking BETWEEN codeunits in one run, not about any
-one codeunit's own source). cli spawns a fresh `al runtests` process — a
-fresh connection — per codeunit, matching the per-codeunit isolation
-websocket already gets from its own reconnect-before-every-codeunit design;
-hub's one persistent connection for the whole run apparently doesn't tear
-down and recreate that isolation scope. Until cli is verified clean of the
-same leak, it's the responsible default — pass --altool-transport hub/auto
-explicitly to opt back into the faster, less-proven path. Output contract is
+The altool leg defaults to --altool-transport auto: ONE persistent connection to
+the TestRunnerHub for the whole leg, falling back to cli (a fresh `al runtests`
+process per codeunit) only when the hub connection cannot be established.
+It used to default to cli, because cli isolates a codeunit that kills its
+session: it costs only that codeunit and not the rest of the run. The hub
+transport now covers that case itself (run_codeunits_via_hub reconnects and
+retries the interrupted codeunit once), and cli's price was too high. In the
+corpus repository's BC 29.0 job the cli leg ran 7,288 tests in 1,660s, of which
+813s (0.76s per codeunit, 1,070 codeunits) was process start, login and
+SignalR negotiation, and the whole test step was at its 30 minute limit. See
+issue #115. Pass --altool-transport cli to get the old behaviour.
+
+READ THIS BEFORE CHANGING THAT DEFAULT ON SingleInstance GROUNDS. The reason
+originally recorded here was that tests asserting a SingleInstance codeunit's
+state RESETS between test codeunits fail under --transport hub and pass under
+websocket, so hub was assumed buggy. That reading was backwards, and it is
+worth stating plainly because it made two runners agree on the wrong answer:
+
+  SingleInstance instances live for the lifetime of the SESSION. Nothing about
+  RequiredTestIsolation / TestIsolation touches them — TestIsolation = Codeunit
+  rolls back DATABASE changes (see the property's documentation). Real BC runs
+  a suite in one client session, because BcContainerHelper defaults
+  RenewClientContextBetweenTests to $false, so that state DOES carry across
+  test codeunits on a real tier.
+
+  Measured on BC 28.4, one container, a SingleInstance codeunit written by one
+  test codeunit and read by the next: --transport hub reads back the written
+  value (correct), --transport cli reads back the default, and the websocket
+  runner used to read back the default too because it renewed its client
+  session before every codeunit. hub was the only one of the three that agreed
+  with a Windows container and a SaaS sandbox. See
+  StefanMaron/MsDyn365Bc.On.Linux#65; the websocket runner no longer renews
+  (tools/TestRunner/Program.cs), so it now agrees as well.
+
+Neither leg is faithful across the board, which is the thing to keep in mind
+when routing: the hub gets SingleInstance lifetime right and TestPermissions
+wrong (issue #64 — no test runner codeunit means the permission execution
+context is never switched, so every test runs as SUPER), and that is why the
+classifier routes anything not declaring TestPermissions = Disabled to
+websocket. Output contract is
 kept identical to run-tests.sh / run-tests-altool.py so existing workflow
 parsing (the "Test codeunits: ..." line, the "N total, P passed, F failed,
 ..." summary line, PIPESTATUS-based exit code checks) keeps working
@@ -65,9 +94,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
-import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -143,6 +172,7 @@ def _run_websocket(args, codeunit_ids: list[int], junit_path: str) -> _RunnerRes
         "--auth", args.auth,
         "--base-url", args.base_url,
         "--dev-url", args.dev_url,
+        "--api-port", str(args.api_port),
         "--timeout", str(args.timeout),
     ]
     if args.company:
@@ -154,7 +184,70 @@ def _run_websocket(args, codeunit_ids: list[int], junit_path: str) -> _RunnerRes
     return r
 
 
-def merge_junit(paths: list[str], out_path: str, total_elapsed: float) -> None:
+def run_legs(args, hub_ids: list[int], ws_ids: list[int],
+             hub_junit: str, ws_junit: str) -> dict[str, _RunnerResult]:
+    """Run both legs SEQUENTIALLY, altool first, and return their results.
+
+    WHY NOT CONCURRENTLY (StefanMaron/BusinessCentral.AL.Language.Tests#158)
+      These two legs used to run on two threads at once. The justification was
+      that they hit different BC endpoints — the dev-endpoint hub versus the
+      client-session websocket — and therefore could not conflict. They do hit
+      different endpoints. They also share one service tier, one tenant, one
+      company and one set of application metadata, and that last one is what
+      broke: a client session that has a page open is invalidated when the
+      metadata generation moves under it, and BC says so with
+
+        The page definition has changed while opening the page, please try to
+        re-open the page. Page ID: <n>
+
+      Measured over the 18 most recent failed runs of the corpus that consumes
+      this workflow: five instances, every one on a 28.x leg and none on 27.0,
+      27.3 or 27.5 — which is the signature, because `test_runner: auto` falls
+      back to the single websocket runner below BC 28 and there is no second
+      leg there to race. Always codeunit 60933, and a DIFFERENT test inside it
+      each time, because the websocket leg's codeunit order is not
+      deterministic. Position predicted the outcome: five failures with 60933
+      at position 2 or 3 of the leg, and the one observation of it running at
+      position 12 passed. The websocket leg takes 25-29 s against the altool
+      leg's 208-271 s, so it fits entirely inside the altool leg's opening
+      phase — no part of it ever ran alone.
+
+      What is NOT established: the BC event-log capture is tail-truncated
+      across the failure window, so there is no server-side trace of a
+      metadata generation actually changing. Serialising is justified by that
+      correlation plus the mechanism, not by a proven server-side record.
+
+    WHY ALTOOL FIRST, and not the other order
+      The websocket leg republishes the app (`bc_publish_app` in
+      run-tests.sh, SchemaUpdateMode=forcesync) before it runs anything. That
+      is the one metadata-mutating action in either leg. Running it last means
+      it happens when nothing else holds a session, instead of at the moment
+      the other leg is opening its first ones.
+
+    Cost: the websocket leg's wall time is no longer hidden inside the altool
+    leg's. On the corpus that is 25-29 s added to a 208-271 s leg, per BC
+    version, across an eight-version matrix on a shared Actions queue.
+    """
+    results: dict[str, _RunnerResult] = {}
+    results["altool"] = _run_altool(args, hub_ids, hub_junit)
+    results["websocket"] = _run_websocket(args, ws_ids, ws_junit)
+    return results
+
+
+# One <testsuite> per codeunit that ever got a CodeunitRun/RecordedResult,
+# named "Codeunit <id>" by both write_junit (run-tests-altool.py) and
+# JUnitWriter.Write (tools/TestRunner) — matches regardless of PASS, FAIL,
+# or "produced zero results, here is why" placeholder. Only a codeunit whose
+# id was silently dropped somewhere between dispatch and the report is
+# missing here.
+_SUITE_CODEUNIT_ID = re.compile(r"^Codeunit (\d+)$")
+
+
+def merge_junit(paths: list[str], out_path: str, total_elapsed: float) -> set[int]:
+    """Merge per-runner JUnit files into one, write it, and return the
+    codeunit ids that produced a <testsuite> in the result — the input a
+    completeness check needs. "The merged total is non-zero" cannot see a
+    codeunit that was dispatched but never came back at all; this can."""
     suites: list[ET.Element] = []
     for p in paths:
         if not p or not os.path.isfile(p):
@@ -180,13 +273,18 @@ def merge_junit(paths: list[str], out_path: str, total_elapsed: float) -> None:
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
     )
+    seen_ids: set[int] = set()
     for s in suites:
         merged.append(s)
+        m = _SUITE_CODEUNIT_ID.match(s.get("name") or "")
+        if m:
+            seen_ids.add(int(m.group(1)))
 
     parent = os.path.dirname(out_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     ET.ElementTree(merged).write(out_path, encoding="unicode", xml_declaration=True)
+    return seen_ids
 
 
 def main() -> int:
@@ -195,6 +293,10 @@ def main() -> int:
     ap.add_argument("--al-source-dir", action="append", default=[], dest="al_source_dirs",
                      help="AL source directory to scan for [HandlerFunctions] usage; repeatable. "
                           "Codeunits with no matching source are routed to websocket.")
+    ap.add_argument("--preprocessor-symbols", default=None,
+                     help="comma-separated AL preprocessor symbols the test app is compiled with. "
+                          "The classifier then skips lines in inactive #if branches. "
+                          "Omit to scan every branch.")
     ap.add_argument("--codeunit-range", default="", help="range filter, same syntax as run-tests.sh")
     ap.add_argument("--junit-output", default="", help="write merged JUnit XML to this path")
     ap.add_argument("--company", default="")
@@ -212,9 +314,9 @@ def main() -> int:
                           "fallback) — pass the same value the caller uses for its own API port, "
                           "e.g. the reusable workflows' instance_slot-derived BC_API_PORT")
     ap.add_argument("--altool-cmd", default="al")
-    ap.add_argument("--altool-transport", default="cli", choices=["cli", "hub", "auto"],
-                     help="transport for the fast-path leg (default cli — see module "
-                          "docstring for why hub/auto aren't the default despite being faster)")
+    ap.add_argument("--altool-transport", default="auto", choices=["cli", "hub", "auto"],
+                     help="transport for the fast-path leg (default auto: one persistent hub "
+                          "connection, cli only if the hub cannot be reached — see module docstring)")
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--codeunit-timeout", type=int, default=10)
     args = ap.parse_args()
@@ -238,7 +340,7 @@ def main() -> int:
     print("Test codeunits: " + _ids_str(all_ids))
 
     if args.al_source_dirs:
-        info = classify.classify_al_source(args.al_source_dirs)
+        info = classify.classify_al_source(args.al_source_dirs, classify.parse_symbols(args.preprocessor_symbols))
         hub_ids = sorted(c for c in all_ids if info.get(c, {}).get("needs_websocket", True) is False)
         ws_ids = sorted(c for c in all_ids if c not in hub_ids)
     else:
@@ -252,19 +354,7 @@ def main() -> int:
     hub_junit = f"{args.junit_output}.hub.xml" if args.junit_output else "/tmp/run-tests-hybrid-hub-junit.xml"
     ws_junit = f"{args.junit_output}.ws.xml" if args.junit_output else "/tmp/run-tests-hybrid-ws-junit.xml"
 
-    results: dict[str, _RunnerResult] = {}
-
-    def go_altool():
-        results["altool"] = _run_altool(args, hub_ids, hub_junit)
-
-    def go_websocket():
-        results["websocket"] = _run_websocket(args, ws_ids, ws_junit)
-
-    threads = [threading.Thread(target=go_altool), threading.Thread(target=go_websocket)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    results = run_legs(args, hub_ids, ws_ids, hub_junit, ws_junit)
     total_elapsed = time.monotonic() - overall_start
 
     for name in ("altool", "websocket"):
@@ -275,30 +365,60 @@ def main() -> int:
         print(f"--- {name} runner output ---")
         print(r.stdout)
 
+    # Merge — and check completeness — unconditionally, even when
+    # --junit-output wasn't requested: the merged codeunit-id set is how a
+    # dropped codeunit gets caught, not just how the file gets written.
+    junit_paths = [r.junit_path for r in results.values() if r.junit_path]
+    merged_out = args.junit_output or "/tmp/run-tests-hybrid-merged-junit.xml"
+    seen_ids = merge_junit(junit_paths, merged_out, total_elapsed)
     if args.junit_output:
-        junit_paths = [r.junit_path for r in results.values() if r.junit_path]
-        merge_junit(junit_paths, args.junit_output, total_elapsed)
         print(f"Merged JUnit XML written to {args.junit_output}")
-        for p in (hub_junit, ws_junit):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+    for p in (hub_junit, ws_junit):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    if not args.junit_output:
+        try:
+            os.remove(merged_out)
+        except OSError:
+            pass
 
     # Aggregate counts straight from the merged JUnit so the summary line
     # matches exactly what got written, rather than re-parsing two
     # differently-shaped stdout formats.
     total = passed = failed = skipped = errors = 0
-    if args.junit_output and os.path.isfile(args.junit_output):
-        root = ET.parse(args.junit_output).getroot()
+    if os.path.isfile(merged_out):
+        root = ET.parse(merged_out).getroot()
         total = int(root.get("tests", "0"))
         failed = int(root.get("failures", "0"))
         errors = int(root.get("errors", "0"))
         skipped = int(root.get("skipped", "0"))
         passed = total - failed - skipped - errors
-    else:
-        # No JUnit requested — fall back to exit codes only, no counts.
-        pass
+
+    # Completeness: every id in all_ids was dispatched to exactly one of
+    # hub_ids/ws_ids (discover_test_codeunits already intersected any
+    # --codeunit-range filter and reflects only what actually compiled into
+    # this .app, so all_ids IS the exact expected set — nothing legitimate
+    # is missing from it). A codeunit missing a <testsuite> entry never ran
+    # ANYTHING, including any infrastructure-error placeholder a runner
+    # would otherwise have recorded for it — that only happens when a
+    # runner's own early-exit path drops it before ever creating a
+    # CodeunitRun. "total != 0" cannot see this; it can look completely
+    # healthy while codeunits are missing (see
+    # https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/57).
+    missing_ids = sorted(set(all_ids) - seen_ids)
+    if missing_ids:
+        missing_hub = sorted(set(hub_ids) & set(missing_ids))
+        missing_ws = sorted(set(ws_ids) & set(missing_ids))
+        print("")
+        print(f"ERROR: {len(missing_ids)} of {len(all_ids)} codeunit(s) produced NO result "
+              f"at all — no <testsuite>, not even a failure — in the merged report: "
+              f"{_ids_str(missing_ids)}")
+        if missing_hub:
+            print(f"       {len(missing_hub)} from the fast path (altool/hub): {_ids_str(missing_hub)}")
+        if missing_ws:
+            print(f"       {len(missing_ws)} from the slow path (websocket): {_ids_str(missing_ws)}")
 
     print("")
     # Keep this exact shape — bc-test-from-source.yml greps
@@ -312,7 +432,9 @@ def main() -> int:
     )
     if any_runner_failed:
         return 1
-    if args.junit_output and total == 0:
+    if missing_ids:
+        return 1
+    if total == 0:
         print("ERROR: no tests ran")
         return 1
     return 0

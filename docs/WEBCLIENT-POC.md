@@ -87,6 +87,21 @@ BC_WEBCLIENT=1 BC_WEBCLIENT_PATHBASE=/my-tier BC_WEBCLIENT_REQUIRE_SSL=1 \
   docker compose up -d --wait
 ```
 
+### Proxies that rewrite the Host header (GitHub Codespaces)
+
+GitHub Codespaces forwards a port through a proxy that sends `Host: localhost:<port>` and puts the browser-facing name only in `X-Forwarded-Host` (with `X-Forwarded-Proto: https`). The web client builds its redirects and resource links from `Host`, so the browser is sent to `http://localhost:8080/...` and the page cannot load its images and scripts.
+
+The same proxy also rewrites the host of `Origin` to `localhost:<port>` and keeps the browser's scheme (`http://` or `https://`, which differs between tunnel clusters); BC rejects a POST or WebSocket upgrade whose `Origin` does not match the request's own origin (400 on `/health/session`, 403 on `/csh`).
+
+Set `BC_WEBCLIENT_TRUST_FORWARDED_HEADERS=1` and the web client applies `X-Forwarded-Host` and `X-Forwarded-Proto` (and translates an `Origin` that names the original host, whatever its scheme, the same way; a foreign origin is still rejected) before BC's own pipeline runs. Set `BC_WEBCLIENT_PUBLIC_URL` to the browser-facing address too, so `PublicWebBaseUrl` (used by the AL debugger's launch URL) matches. Leave both unset for direct `http://localhost` access, and only turn the first on behind a proxy you control: any client can send these headers.
+
+The dev container does both in `postCreateCommand`:
+
+```bash
+BC_WEBCLIENT=1 BC_WEBCLIENT_TRUST_FORWARDED_HEADERS=1 \
+  BC_WEBCLIENT_PUBLIC_URL=https://<codespace>-8080.app.github.dev/ docker compose up -d --wait
+```
+
 ## Architecture
 
 ```

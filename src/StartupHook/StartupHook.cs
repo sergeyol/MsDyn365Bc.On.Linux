@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -41,15 +42,36 @@ using System.Threading.Tasks;
 ///   Fix: No-op SideServiceProcessClient.EnsureAlive() so the watchdog loop becomes silent.
 ///
 /// Patch #21: NavOpenTaskPageAction.ShowForm (Nav.Client.UI.dll)
-///   When a test method opens a task page, the headless client has no UI renderer and
-///   NavOpenTaskPageAction.ShowForm throws NullReferenceException, terminating the entire
-///   test session and leaving all remaining test methods unexecuted.
-///   Fix: No-op ShowForm so task-page opens are silently skipped on Linux.
+///   When a test method opens a task page, something in the headless client's UI layer
+///   raised a NullReferenceException that terminated the entire test session and left all
+///   remaining test methods unexecuted.
+///   Fix: re-implement the real body (the signature and body are identical on 27.0 through
+///   28.4) so the form is actually shown, the client raises UISession.FormToShow, and
+///   NavTestExecution.ShowForm looks up and runs the test's [PageHandler] /
+///   [ModalPageHandler]. A NullReferenceException escaping the show call is logged with its
+///   full stack and reported as "not shown" instead of killing the session. The original
+///   no-op is still reachable via BC_SHOWFORM_MODE=skip.
+///   The old replacement also returned void where the real method returns bool, so
+///   InvokeCore's `if (!ShowForm(...))` read an undefined return value.
 ///
 /// Patch #22: AzureADGraphQuery..ctor (Nav.Ncl.dll)
 ///   Constructor pulls in Azure.Identity / MSAL Windows credential APIs and crashes the
 ///   session on Linux. Fix: no-op the ctor — fields stay default; tests don't need real
 ///   Azure AD calls, only that the GraphQuery DotNet object can be constructed.
+///
+/// Patch #22b: GraphQuery.GetTenantDetail (Microsoft.Dynamics.Nav.AzureADGraphClient.dll,
+///   Add-ins/GraphClient/ — a separate, lazily-loaded assembly from Nav.Ncl.dll)
+///   Even with Patch #22 applied, calling GraphQuery.GetTenantDetail() (reached from AL's
+///   IsPlanAssignedToUser, used by several ISV install codeunits e.g. Continia OPplus) still
+///   throws NullReferenceException: GraphQuery's own parameterless ctor always builds its
+///   inner AzureADGraphQuery with a null NavSession regardless of what session is actually
+///   current, and GetTenantDetailAsync unconditionally dereferences that null session before
+///   reaching its own "no AAD tenant, use an empty TenantInfo" fallback. BC reports the NRE via
+///   a generic, misleading "You must assign at least one user the SUPER permission set..."
+///   error — the fallback message for ANY failed install-transaction commit, not actually
+///   about SUPER/NavUserPassword. Fix: hook the synchronous GetTenantDetail() wrapper (NOT the
+///   async GetTenantDetailAsync — see Patch #20's own comment on why hooking an async method
+///   mid-flight risks AccessViolationException) to return an empty TenantInfo directly.
 ///
 /// Patch #23: OfficeWordDocumentPictureMerger.ReplaceMissingImageWithTransparentImage
 ///   (Microsoft.Dynamics.Nav.OpenXml.dll)
@@ -94,6 +116,14 @@ using System.Threading.Tasks;
 ///   proxy Patch #7 already builds (extended to no-op CreateKey/DeleteKey/ImportKey/ExportKey
 ///   too), so "encryption" always reports enabled/present and Encrypt/Decrypt round-trip as
 ///   plain text. Good enough for tests to stop erroring; not real cryptography.
+///   OPT-IN SINCE 2026-09 (issue #66): the header above was wrong about why CreateKey()
+///   failed. Nothing in it is Windows-only — it is RSACryptoServiceProvider, ToXmlString and
+///   File.Create, all of which work on .NET 8 Linux. It failed because the CRONUS demo backup
+///   ships its single [$ndo$tenantproperty] row with a BLANK tenantid while the NST runs
+///   tenant 'default', so the UPDATE that persists the key file name matched zero rows and the
+///   next line's RequireKeyCreatedAndPresent() threw. entrypoint.sh sets that tenantid now and
+///   real encryption works, so this patch no longer applies by default.
+///   BC_FAKE_ENCRYPTION=1 brings it back.
 ///
 /// Patch #27: NavClientHandle.Dispose (Nav.Ncl.dll)
 ///   Disposing a form/page that held a .NET client handle throws NullReferenceException on
@@ -127,6 +157,189 @@ using System.Threading.Tasks;
 ///   (the call is gated on IServiceTopology.IsServiceRunningInLocalEnvironment, which Patch #9's
 ///   Linux topology proxy forces false).
 ///   Fix: return null, which is what the gated-off path produced. Applied on all versions.
+///
+/// Patch #30: Dev Services 401 missing WWW-Authenticate header (Microsoft.Dynamics.Nav.Service.Dev.dll)
+///   The Dev Services endpoint (/BC/dev/*) never sends a WWW-Authenticate header on a 401,
+///   unlike /BC/ODataV4/* (which correctly returns "WWW-Authenticate: Basic realm=..."). This
+///   breaks any client doing proper HTTP challenge-response Basic auth (send unauthenticated,
+///   read WWW-Authenticate, resend with credentials) instead of sending credentials proactively
+///   — including .NET's HttpClientHandler and, per the decompiled ms-dynamics-smb.al VS Code
+///   extension, the AL Language Server's own publish flow. curl with `-u` is unaffected (sends
+///   Basic auth proactively, no negotiation), which is why publish-workspace.sh never hit this.
+///   Fix: hook DevTenantAuthorizationMiddleware.InvokeAsync (runs unconditionally on every Dev
+///   request before routing/auth-decision finalization) to register an HttpResponse.OnStarting
+///   callback that adds the header when the response ends up 401. See PatchNavAuthenticationChallenge
+///   for the full root-cause writeup and why several other approaches were rejected.
+///
+/// Patch #31: LanguageHelper..ctor (Nav.Types.dll) — issue #52, Chinese captions in English sessions
+///   Platform (system/virtual) table captions ship as CaptionML strings keyed by Windows
+///   three-letter language names ("BGR=…;CHS=…;CHT=所有設定檔;…;ENU=All Profile;…").
+///   MultiLanguage.Parse maps each abbreviation to an LCID through LanguageHelper, whose table
+///   is built from CultureInfo.GetCultures(AllCultures) filtered to cultures with a real LCID.
+///   On Linux (.NET/ICU) Chinese is enumerated only as script-qualified names (zh-Hant-TW,
+///   zh-Hans-CN, …) whose LCID is 4096 (LOCALE_CUSTOM_UNSPECIFIED), so they are filtered out
+///   and "CHT" never enters the table. Unknown abbreviations fall back to DefaultLanguageId
+///   (1033), so the Chinese text is stored under the English LCID — and because CaptionML is
+///   alphabetical and every lookup is first-match, "CHT" shadows "ENU" for EVERY caption
+///   lookup on those tables, regardless of session language (GlobalLanguage was verified 1033).
+///   AL apps are unaffected: their xlf lines resolve LCIDs via CultureInfo.GetCultureInfo(name).
+///   Fix: rebuild the two LanguageHelper dictionaries from WindowsLanguageHelper.AllCultures
+///   plus the script-stripped cultures ICU refuses to enumerate (zh-TW/1028/CHT,
+///   zh-HK/3076/ZHH, …), ordered by LCID exactly like the original iteration. On Windows the
+///   augmentation finds nothing, so the result is identical to the stock table. The session
+///   language is NOT touched: a test that calls GLOBALLANGUAGE(1028) still gets Chinese.
+///
+/// Patch #32: NavLicense.Dispose(bool) (Nav.Ncl.dll) — license teardown races an active session
+///   NavDatabase.Dispose tears down its NavDatabaseSecurityAndLicense, which disposes the
+///   NavLicense, which does `dataReader?.Dispose(); dataReader = null;`. BclLicenseDataReader
+///   .Dispose is literally `reader = null;` and every one of its readers — TryGetPermissionMask
+///   included — dereferences `reader` with no null check. Meanwhile
+///   NavDatabaseSecurityAndLicense.GetLicensePermissions calls getLicenseFunc (→
+///   NavCurrentThread.Session.License.GetLicensePermissionMask) OUTSIDE its licenseLock. So a
+///   database torn down while a session is still executing AL gives that session a
+///   NullReferenceException inside BclLicenseDataReader.TryGetPermissionMask — surfaced to the
+///   test runner as "Unexpected CLR exception thrown." on whatever statement happened to need a
+///   permission check (observed: ALTFixtureCleanup.Initialize → Record.DeleteAll).
+///   Not Linux-specific — nothing in the path is a Win32 API — but bc-linux provokes it hard:
+///   the altool runner's `cli` transport opens a fresh session per codeunit, and the hybrid
+///   runner runs a second websocket leg concurrently, so database teardown and session start
+///   overlap constantly. One flaky failure in a 315-codeunit run is enough to redden a leg.
+///   Fix: no-op Dispose(bool). Its entire body is GC bookkeeping — no unmanaged resource, no
+///   handle, and `isDisposed` is read nowhere but inside Dispose itself. The owning
+///   NavDatabaseSecurityAndLicense nulls its own `license` field regardless, so the whole graph
+///   still becomes unreachable at the same instant; nothing is retained. A session that races
+///   the teardown now reads a still-valid license instead of crashing.
+///   Method body verified byte-identical on BC 27.0, 28.0 and 28.4.
+///
+/// Patch #32b: NavDatabaseSecurityAndLicense.Dispose(bool) (Nav.Ncl.dll)
+///   The same teardown, one frame out, and the sibling of the window #32 closes.
+///   GetLicensePermissions brackets its memo-cache with licenseLock.EnterReadLock() /
+///   EnterUpgradeableReadLock(); Dispose calls licenseLock.Dispose() from the teardown
+///   thread. So a race that lands on either Enter gets ObjectDisposedException
+///   (ReaderWriterLockSlim) rather than the NullReferenceException #32 fixes — same trigger,
+///   same session, different exception. Fixing only #32 would swap one flake for another.
+///   Fix: no-op Dispose(bool). Unlike #32 this one DOES skip a real Dispose call — the
+///   ReaderWriterLockSlim's. That is acceptable and deliberate: RWLS holds no OS handle of
+///   its own, only up to three lazily-created wait events that the finalizer reclaims, there
+///   is exactly one lock per NavDatabase, and the object graph still becomes unreachable when
+///   NavDatabase drops it. `isDisposed` is read nowhere but inside Dispose itself, the type
+///   has no subclasses (so hooking the base cannot be bypassed by an override), and `license
+///   = null` is redundant once the owner is going away.
+///   Method body verified byte-identical on BC 27.0 and 28.0.
+///
+/// Patch #33: AspNetCoreApiHost.CreateBaseAddress (Microsoft.Dynamics.Nav.Service.AspNetCore.dll) — issue #91
+///   BC 30 hosts several API endpoints on one port, separated by URL path
+///   (http://+:7048/BC/ODataV4 and /BC/api/webhooks, http://+:7085/BC/client and
+///   /BC/client/health, ...). HTTP.SYS routes those by prefix on one port. These hosts use
+///   Kestrel directly, which cannot bind a port twice, so the second Open() threw
+///   AddressInUseException (19 on one boot), the NST service start failed, and no port was
+///   opened at all. HttpSysStub already splits ports for hosts that go through UseHttpSys;
+///   these bypass it.
+///   Fix: auxiliary endpoints (health, webhooks, mcp) always get their own port in a spare
+///   range (+10000); a primary endpoint that finds its port already claimed moves too, the
+///   REST API to ODataServicesPort + 4 where tooling maps its host port. The assignment is
+///   keyed by endpoint so Open() and Resume() agree, and every move is logged. Companion
+///   change in entrypoint.sh: ManagementApiServicesEnabled is forced off, because its host
+///   File.Delete()s a Unix socket path in a directory that does not exist.
+///   Applied on BC 30 and later only: before that the hosts go through UseHttpSys, where
+///   HttpSysStub already splits the ports. Not covered: BC 30 still returns HTTP 422
+///   publishing the test framework apps.
+/// Patch #34: DevTestRunnerCodeunit.OnBeforeTestRunAsync (Nav.Ncl.dll) — issue #97
+///   The altool/TestRunnerHub runner drives tests through this C# test runner, not an AL Test
+///   Runner codeunit, so the "Test Runner - Mgt" events never fire and Microsoft's
+///   ALTestRunnerResetEnvironment (130453) never runs. Its OnBeforeTestMethodRun calls
+///   ClearLastError() before every test method; on the hub nothing does, so the last error a
+///   test trapped is still there when the next method in the same codeunit starts
+///   (GetLastErrorText returns it). Measured on BC 28.4: A traps Error('X'), B asserts
+///   GetLastErrorText() = '' — passes on the websocket runner, fails on the hub.
+///   Fix: re-implement the real body (it only filters on TestsToRun and raises
+///   OnBeforeTestRunEvent) and call NavSession.ClearLastError() first. Applied only to the hub's
+///   runner class, so the websocket runner and a real tier are untouched.
+///   NOT covered: the rest of 130453 (application areas, WorkDate, codeunits 130301/130302/
+///   132553) is also skipped on the hub; the last error is the only part measured.
+/// Patch #38: hub test session SuppressUnhandledUI (Nav.Service.Dev.dll) — issue #139
+///   The hub's TestRunnerRuntime sets TestExecution.SuppressUnhandledUI = true, so an
+///   unhandled Confirm, Message, StrMenu or page open raised nothing. A Windows test session
+///   fails with "Unhandled UI: <kind> <text>" (MissingUIHandler). Fix: Patch #34's
+///   replacement sets the property back to false before every test method.
+/// Patch #35: NavFile.ALIsPathTemporary (Nav.Ncl.dll) — issue #122
+///   BC's IsPathTemporary is "ExpandFileName(enforceUserPath: true) did not throw". Patch #28
+///   stopped ExpandFileName enforcing the user folder, so every path came back temporary —
+///   "C:\x", "\\server\share\x" and "/" included, where a Windows tier says false.
+///   Fix: answer the original question directly. A path is temporary when it resolves inside
+///   the session's user folder ('\' read as '/', relative paths combined with the folder); a
+///   drive letter or a UNC path is rooted outside it, as on Windows. Empty is true, as
+///   before. The trapped call returns false; the untrapped one throws BC's own
+///   NavNCLInvalidPathException with Lang.FileAccessLimitedToUserFolder. #28 is unchanged.
+/// Patch #36: TestRunnerClientCallback file callbacks (Nav.Service.Dev.dll) — issue #122
+///   The hub's client callback says false to a download and to an import of a .navdata file.
+///   A Windows container's test run goes through the web server's client-services session,
+///   which hands the download to the caller (true, file name unchanged) and refuses the
+///   upload with NavNotSupportedFileDialogProviderException. Fix: DownloadFileAction returns
+///   true, ImportDataAction (behind Database.ImportData and DataFileInformation) throws that
+///   exception. ExportDataAction reads the export stream and returns true, so
+///   Database.ExportData returns true (issue #138); UploadFileAction throws the same exception,
+///   so an import xmlport with no source fails as on Windows (issue #141). The websocket runner's client answers the same way (tools/TestRunner,
+///   FileActionDialog); before that change it answered with a null result, which BC
+///   dereferenced (NullReferenceException in AL, and on BC 27 the session ended).
+/// Patch #37: TestRunnerClientCallback RunOnClient DotNet (Nav.Service.Dev.dll) — issue #125
+///   The hub's client callback answers CreateDotNetHandle and InvokeAutomationMethod with
+///   null. A page whose trigger asks "UserTours.IsAvailable()" (the Business Manager Role
+///   Center's "O365 Activities" part, PageNotifier, CameraProvider ...) then dereferences the
+///   null handle. A Windows test run's client is the web server's ObservingAutomationHandler:
+///   it hands out a handle for a known client extension type when no instance is asked for,
+///   says false to the static IsAvailable (no browser, so no extension), and refuses anything
+///   else with NavDotNetFromAlNotSupportedException. Fix: the same answers. The websocket
+///   runner's client gives them too (tools/TestRunner, CreateDotNetHandle).
+/// Patch #39: Microsoft.Dynamics.Nav.Timer.OnTimerElapsed (Microsoft.Dynamics.Nav.Timer.dll) — issue #136
+///   An Error() in a DotNet Timer's Elapsed trigger: with RedirectExceptions false the add-in
+///   rethrows on its thread-pool thread, which ended the whole NST (rc=134, BC 28.5). On
+///   Windows the test runs to the end; Elapsed fired, ExceptionOccurred did not. Fix: the same
+///   body without the rethrow. RedirectExceptions timers still raise ExceptionOccurred.
+/// Patch #40: NavMediaImageSkia.Bytes (Nav.Ncl.dll) — BC 29, issue #135
+///   BC 29 builds a NavMediaImageSkia instead of a NavMediaImage when OperatingSystem.IsWindows()
+///   is false, and its Bytes() returns the imported bytes; Windows re-encodes them with GDI+.
+///   Fix: hand a PNG to DrawingStub's GdiPlusPng (what BC 27/28 reach through
+///   NavMediaImage.Bytes); anything it does not handle keeps the source bytes.
+/// Patch #41: WildcardEvaluatorHelper.IsPrefixSuffixInternal / IndexOf (Nav.Ncl.dll) — BC 27, issue #153
+///   BC 27 matches the parts of a filter around a '?' wildcard with kernel32's FindNLSString
+///   (BC 28 and later use CompareInfo). On Linux that call reaches libwin32_stubs.so, which
+///   always answers "not found", so every in-memory filter with a '?' matched nothing: a
+///   temporary record's SetFilter, and the license's posting-date filter ("??11*|??12*|...")
+///   that refuses every date typed into a page. Fix: the same CompareInfo calls BC 28 makes.
+///   BC 28 and later have no such class and are not touched.
+/// Patch #42: NavMediaImageSkia.DecodeBitmapOrThrow (Nav.Ncl.dll) — BC 29, issue #161
+///   BC 29 decodes an imported image with Skia to build its thumbnail. Skia refuses a PNG whose
+///   chunk checksums do not add up (the corpus's 1x1 PNG one byte short), so ImportStream fails
+///   with "not a valid image type". GDI+ on Windows accepts that file and stores 99 bytes.
+///   Fix: when Skia returns no bitmap, decode the bytes DrawingStub's GdiPlusPng writes for the
+///   same source. Anything GdiPlusPng does not handle is refused as before.
+/// Patch #43: HttpClientRequestFilterService.RequestUserPermissionForBlockingOrAllowingRequestFromApplication (Nav.Ncl.dll) — issue #165
+///   A Sandbox tenant asks the user before an extension's first HttpClient request when the
+///   app has no row in the app setting table: StrMenu "Allow Always,Allow Once,Block Always,
+///   Block Once". A Windows container publishes through the dev endpoint with that setting
+///   on, so a test never sees the prompt. Nobody can answer it in a test session. The hub
+///   used to hide it because it suppressed unhandled UI (Patch #38 ended that): a request to
+///   an unresolvable host then raised "Unhandled UI: StrMenu ..." or returned a default
+///   response with status 200, where Windows sends the request and reports the socket error.
+///   Fix: answer "Allow Once" without asking and without saving a row.
+///   BC_DISABLE_PATCHES=43 restores the prompt.
+/// Patch #19b: NavSession.InitReportingClientAsync (Nav.Ncl.dll) — BC 29, issue #109
+///   BC 29 removed NavEnvironment.CustomReportingServiceClient (the factory Patch #19 replaced) and
+///   kept only DecorateReportingServiceClient, which wraps a client InitReportingClientAsync has
+///   already built — after asking the SideServiceWatchdog for the reporting side service and
+///   throwing "Reporting service is not available." when Patch #18 left none registered. Applied
+///   only when #19's member is absent: the method is hooked to return the same no-op proxy, so
+///   Report.SaveAs gives one message on every BC version.
+/// Patch #19a on BC 29 (NativeRdlcService.cs, only with BC_RDLC_RENDERER=mono) — issue #143
+///   BC 29's reporting protocol is HTTP. With the Mono renderer active, InitReportingClientAsync is
+///   hooked to return BC's own ReportingServiceHttpClient for the supervised service process, and
+///   ReportingProcessStartup.GetReportingServiceHostUrl to return its loopback URL. #19b is not
+///   applied in that case.
+/// winspool.drv stubs (kernel32_stubs.c) — BC 29, issue #108
+///   Nav.Types PrinterHelper.GetPrinters P/Invokes winspool.drv while a report request page is
+///   built; the library does not exist here (DllNotFoundException). The stubs answer as a host
+///   with no printers: EnumPrinters succeeds with zero entries, there is no default printer.
 ///
 /// JMP hooks work ONLY on BC methods (JIT-compiled). BCL methods are ReadyToRun pre-compiled
 /// and cannot be patched this way.
@@ -176,6 +389,55 @@ internal class StartupHook
     private static bool _encryptionBypassed;
     private static bool _encryptionApplying;
     private static object? _originalTopology;
+    // Patch #30 state — the poll timer that waits for Microsoft.Dynamics.Nav.Service.Dev
+    // to load must be rooted somewhere other than its own Elapsed handler (which is not
+    // a GC root). This container runs with DOTNET_gcServer=1, and a Gen2 collection
+    // during BC's heavy startup allocation could otherwise collect the timer before the
+    // target assembly ever loads, silently disabling the whole patch. See
+    // PatchNavAuthenticationChallenge's call site for where this is assigned.
+    private static System.Timers.Timer? _devAssemblyPollTimer;
+    // Patch #30: reflection handles resolved ONCE at patch-apply time (not per request)
+    // — see PatchNavAuthenticationChallenge for where these are populated.
+    private static FieldInfo? _devTenantAuthNextField;
+    private static PropertyInfo? _httpContextResponseProperty;
+    private static PropertyInfo? _httpResponseStatusCodeProperty;
+    private static PropertyInfo? _httpResponseHeadersProperty;
+    private static MethodInfo? _httpResponseOnStartingMethod;
+    private static PropertyInfo? _headerDictionaryIndexer;
+    private static MethodInfo? _headerDictionaryContainsKeyMethod;
+    private static ConstructorInfo? _stringValuesCtor;
+
+    // The process default culture (LANG=en_US.UTF-8 -> ICU en-US) writes U+202F before AM/PM, a
+    // Windows (NLS) tier a plain space. PatchNclTestPage fixes the cultures BC builds itself, but
+    // work that runs on a pool thread BC never gave a culture (query SaveAsCsv, issue #120) formats
+    // with the process default. Replace that default with a clone that has plain spaces.
+    // BC_WINDOWS_TEXT=0 turns it off together with the IL rewrites.
+    private static void ApplyWindowsDefaultCulture()
+    {
+        if (Environment.GetEnvironmentVariable("BC_WINDOWS_TEXT") == "0") return;
+        try
+        {
+            CultureInfo current = CultureInfo.CurrentCulture;
+            if (current.IsNeutralCulture || current.Name.Length == 0) return;
+            DateTimeFormatInfo src = current.DateTimeFormat;
+            CultureInfo copy = (CultureInfo)current.Clone();
+            DateTimeFormatInfo d = copy.DateTimeFormat;
+            d.ShortTimePattern = src.ShortTimePattern.Replace('\u202F', ' ');
+            d.LongTimePattern = src.LongTimePattern.Replace('\u202F', ' ');
+            d.ShortDatePattern = src.ShortDatePattern.Replace('\u202F', ' ');
+            d.LongDatePattern = src.LongDatePattern.Replace('\u202F', ' ');
+            d.FullDateTimePattern = src.FullDateTimePattern.Replace('\u202F', ' ');
+            d.AMDesignator = src.AMDesignator.Replace('\u202F', ' ');
+            d.PMDesignator = src.PMDesignator.Replace('\u202F', ' ');
+            copy = CultureInfo.ReadOnly(copy);
+            CultureInfo.DefaultThreadCurrentCulture = copy;
+            CultureInfo.CurrentCulture = copy;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] default culture fix skipped: {ex.Message}");
+        }
+    }
 
     public static void Initialize()
     {
@@ -184,6 +446,8 @@ internal class StartupHook
 
 
         Console.WriteLine("[StartupHook] Initializing Linux compatibility patches...");
+
+        ApplyWindowsDefaultCulture();
 
         // Debug aid (opt-in): BC_DEBUG_FIRSTCHANCE=1 prints every thrown exception
         // with its full inner chain to stderr. Mirrors WEBCLIENT_DEBUG_FIRSTCHANCE in
@@ -298,6 +562,36 @@ internal class StartupHook
         AppDomain.CurrentDomain.AssemblyLoad += OnAssemblyLoad;
         TryEagerPatch();
 
+        // Patch #30: Microsoft.Dynamics.Nav.Service.Dev.dll never fires the AssemblyLoad
+        // event we just subscribed to above — confirmed empirically (its types show up in
+        // exception stack traces during boot, but OnAssemblyLoad's "name == ..." branch for
+        // it never runs, and it's also not yet resident in
+        // AppDomain.CurrentDomain.GetAssemblies() this early). It's a direct static
+        // reference of the entry assembly, loaded by the runtime as part of building the
+        // Dev/OData/Client host pipelines — well after StartupHook.Initialize() runs, but
+        // apparently without ever raising the standard AssemblyLoad notification (unlike
+        // Nav.Ncl, Nav.Types, etc., which the AssemblyLoad-event pattern elsewhere in this
+        // file works for). Poll for it on a background timer instead: cheap, self-cancelling
+        // once found, and immune to whatever undocumented load path BC uses.
+        {
+            var pollTimer = new System.Timers.Timer(TimeSpan.FromSeconds(2));
+            _devAssemblyPollTimer = pollTimer;
+            pollTimer.Elapsed += (_, _) =>
+            {
+                var asm = AppDomain.CurrentDomain.GetAssemblies()
+                    .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.Service.Dev");
+                if (asm == null) return;
+                pollTimer.Stop();
+                pollTimer.Dispose();
+                _devAssemblyPollTimer = null;
+                PatchNavAuthenticationChallenge(asm);
+                PatchTestRunnerClientCallback(asm);
+                PatchTestRunnerClientCallbackDotNet(asm);
+            };
+            pollTimer.AutoReset = true;
+            pollTimer.Start();
+        }
+
         // Patch #18: No-op SetupSideServices — must be patched before Main() calls it.
         try
         {
@@ -348,6 +642,31 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchALDatabaseALSid(args.LoadedAssembly);
+            // Patch #19a: with the Mono RDLC renderer staged (BC_RDLC_RENDERER=mono
+            //   and the entrypoint's Step 2c reporting success), install BC's own
+            //   gRPC client against a reporting process we supervise, instead of
+            //   the no-op below. Patch #18 stays applied either way — we start the
+            //   process ourselves rather than letting the Windows lifecycle do it.
+            //   Any failure here falls back to the no-op client: reports then fail
+            //   the way they do without the renderer, which beats failing boot.
+            bool rdlcStarted = false;
+            if (NativeRdlcService.Enabled)
+            {
+                try
+                {
+                    NativeRdlcService.Start(args.LoadedAssembly);
+                    rdlcStarted = true;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[StartupHook] Patch #19a: native RDLC not started ({ex.Message}); using the no-op client");
+                }
+            }
+            if (rdlcStarted)
+            {
+                Console.WriteLine("[StartupHook] Patch #19a: native RDLC renderer active");
+            }
+            else
             // Patch #19: Set CustomReportingServiceClient to no-op factory.
             //   BC's Reporting Service is a Windows PE binary that can't run on Linux.
             //   When test code triggers RDLC rendering, BC tries to connect to the
@@ -355,12 +674,6 @@ internal class StartupHook
             //   NavEnvironment has a built-in hook: CustomReportingServiceClient.
             //   Setting it to a no-op factory bypasses gRPC entirely.
             PatchReportingServiceClient(args.LoadedAssembly);
-        }
-
-        // Patch #16b: NavUser.TryAuthenticate bypass (password hash doesn't verify on Linux)
-        if (name == "Microsoft.Dynamics.Nav.Ncl")
-        {
-            PatchNavUserTryAuthenticate(args.LoadedAssembly);
         }
 
         // Patch #22: AzureADGraphQuery constructor bypass.
@@ -373,6 +686,19 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchAzureADGraphQuery(args.LoadedAssembly);
+        }
+
+        // Patch #22b: GraphQuery.GetTenantDetail — see PatchGraphQueryGetTenantDetail's header
+        // comment for the full story. Microsoft.Dynamics.Nav.AzureADGraphClient.dll (Add-ins/
+        // GraphClient/) is a SEPARATE, lazily-loaded assembly from Nav.Ncl.dll, so it needs its
+        // own AssemblyLoad hook rather than piggybacking on Patch #22's Nav.Ncl-triggered one.
+        // This is the realistic trigger path (AzureADGraphClient loads later/lazily than
+        // Nav.Ncl), so the IsPatchDisabled("22b") gate must be checked here too, not just in
+        // PatchGraphQueryGetTenantDetail — that one only guards the Nav.Ncl-triggered call,
+        // which usually loses the race to this one.
+        if (name == "Microsoft.Dynamics.Nav.AzureADGraphClient" && !IsPatchDisabled("22b"))
+        {
+            ApplyGraphQueryGetTenantDetailPatch(args.LoadedAssembly);
         }
 
         // Patch #26: TenantEncryptionProviderFactory.GetTenantEncryptionProvider bypass.
@@ -415,6 +741,18 @@ internal class StartupHook
             PatchWatsonReporting(args.LoadedAssembly);
         }
 
+        // Patch #39: an AL error in a DotNet Timer's Elapsed trigger must not end the process.
+        if (name == "Microsoft.Dynamics.Nav.Timer")
+        {
+            PatchNavTimerElapsed(args.LoadedAssembly);
+        }
+
+        // Patch #33: give colliding API endpoints their own ports.
+        if (name == "Microsoft.Dynamics.Nav.Service.AspNetCore")
+        {
+            PatchApiHostPorts(args.LoadedAssembly);
+        }
+
         // Patch #14: Fix Cecil type-forwarding crash in server-side AL compiler.
         // CecilDotNetTypeLoader.IsTypeForwardingCircular throws NullRef when
         // following type-forwarding chains in netstandard.dll on Linux.
@@ -452,6 +790,14 @@ internal class StartupHook
         {
             Console.WriteLine("[StartupHook] Nav.Types.dll loaded — patching");
             PatchNavTypes(args.LoadedAssembly);
+        }
+
+        // Patch #31: complete LanguageHelper's three-letter language table on ICU (issue #52).
+        // Must be hooked before the lazily-created LanguageHelper singleton is first used;
+        // assembly load is the earliest point, and no code from the assembly has run yet.
+        if (name == "Microsoft.Dynamics.Nav.Types")
+        {
+            PatchLanguageHelperCultureTable(args.LoadedAssembly);
         }
 
         // Patch #15: Remove .NET runtime directory from server-side compiler's assembly probing.
@@ -494,15 +840,58 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Ncl")
         {
             PatchNavFileExpandFileName(args.LoadedAssembly);
+            // Patch #35: #28 no longer enforces the user folder, and ALIsPathTemporary is
+            // built on that check — answer it here instead (issue #122).
+            PatchNavFileIsPathTemporary(args.LoadedAssembly);
         }
 
-        // Patch #16 is now only 16b (NavUser.TryAuthenticate bypass in Nav.Ncl).
-        // The full ValidateAsync chain runs normally to populate the auth cache,
-        // but password hash verification is bypassed via TryAuthenticate.
+        // Patch #32: NavLicense.Dispose(bool) races an in-flight session's permission check
+        // and hands it a NullReferenceException from BclLicenseDataReader. No-op the dispose;
+        // it is pure GC bookkeeping. See the header comment for the full chain.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchNavLicenseDispose(args.LoadedAssembly);
+            PatchNavDatabaseSecurityAndLicenseDispose(args.LoadedAssembly);
+        }
 
-        // Patch #21: NavOpenTaskPageAction.ShowForm crashes on Linux when a test opens a
-        // task page — the headless client has no UI renderer and a null reference occurs,
-        // terminating the entire test session. No-op ShowForm so task-page opens are skipped.
+        // Patch #41: BC 27 matches '?' filter parts through kernel32 FindNLSString, which the
+        // Linux stub answers with "not found" (issue #153). Only BC 27 has the class.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchWildcardEvaluatorHelper(args.LoadedAssembly);
+        }
+
+        // Patch #43: the outbound HttpClient approval prompt cannot be answered in a test
+        // session (issue #165).
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchHttpClientRequestPrompt(args.LoadedAssembly);
+        }
+
+        // Patch #40: BC 29's non-Windows media image keeps the imported bytes; Windows
+        // re-encodes through GDI+ (issue #135). Only BC 29 has the class.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchNavMediaImageSkiaBytes(args.LoadedAssembly);
+        }
+
+        // Patch #42: BC 29's Skia decode refuses a PNG GDI+ accepts (issue #161). Only BC 29
+        // has the class.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchNavMediaImageSkiaDecode(args.LoadedAssembly);
+        }
+
+        // Patch #34: the hub's test runner never clears the last error between test methods
+        // (issue #97). Applied on every version; the class only exists where the hub does.
+        if (name == "Microsoft.Dynamics.Nav.Ncl")
+        {
+            PatchDevTestRunnerOnBeforeTestRun(args.LoadedAssembly);
+        }
+
+        // Patch #21: NavOpenTaskPageAction.ShowForm used to crash the whole test session on
+        // Linux with a null reference. Re-implement the real body so the form is shown and
+        // the test's page handler runs, and contain a null reference to this one call.
         if (name == "Microsoft.Dynamics.Nav.Client.UI")
         {
             PatchShowForm(args.LoadedAssembly);
@@ -520,6 +909,16 @@ internal class StartupHook
         if (name == "Microsoft.Dynamics.Nav.Service")
         {
             PatchFindClientTimeZone(args.LoadedAssembly);
+        }
+
+        // Patch #30: fallback in case a future BC version does raise this notification
+        // for Microsoft.Dynamics.Nav.Service.Dev — see the poll-timer registration in
+        // Initialize() for why this isn't the primary trigger.
+        if (name == "Microsoft.Dynamics.Nav.Service.Dev")
+        {
+            PatchNavAuthenticationChallenge(args.LoadedAssembly);
+            PatchTestRunnerClientCallback(args.LoadedAssembly);
+            PatchTestRunnerClientCallbackDotNet(args.LoadedAssembly);
         }
 
     }
@@ -629,6 +1028,7 @@ internal class StartupHook
         "ntdsapi", "ntdsapi.dll",
         "rpcrt4", "rpcrt4.dll",
         "advapi32", "advapi32.dll",
+        "winspool.drv", "winspool", "winspool.dll",
         "httpapi", "httpapi.dll",
         "gdiplus", "libgdiplus", "libgdiplus.so", "libgdiplus.so.0",
     };
@@ -755,6 +1155,9 @@ internal class StartupHook
 
             // --- Patch #9: Replace Topology with one that returns IsServiceRunningInLocalEnvironment=false ---
             // This makes NavDirectorySecurity skip Windows ACL APIs (returns null instead).
+            // About 20 places in Nav.Ncl read this flag. NavTestExecution.TestHandleHttpClientRequest
+            // needs Windows' true to call a test's [HttpClientHandler]; PatchNclTestPage's
+            // testhttphandler command rewrites that one read on disk (issue #192).
             Type? topoIfaceType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.IServiceTopology");
             if (topoIfaceType != null)
             {
@@ -1457,8 +1860,14 @@ internal class StartupHook
                 BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
             if (prop == null)
             {
-                Console.WriteLine("[StartupHook] Patch #19: CustomReportingServiceClient not found");
+                // BC 29 dropped CustomReportingServiceClient (the factory that replaced the
+                // whole client) for DecorateReportingServiceClient, which only wraps a client
+                // NavSession.InitReportingClientAsync has already built — and that method asks
+                // the SideServiceWatchdog for the reporting side service first and throws
+                // "Reporting service is not available." when Patch #18 left it unregistered.
+                // So hook InitReportingClientAsync itself (Patch #19b).
                 _reportingClientPatched = true;
+                TryHookInitReportingClient(navNcl);
                 return;
             }
             field = null; // will use property setter below
@@ -1513,6 +1922,63 @@ internal class StartupHook
 
         _reportingClientPatched = true;
         Console.WriteLine("[StartupHook] Patch #19: CustomReportingServiceClient → no-op proxy");
+    }
+
+    // Patch #19b: BC 29 — hook NavSession.InitReportingClientAsync to hand back the no-op
+    // client directly. Same observable behaviour as #19 on 27/28: RenderAsync/PrintReportAsync
+    // raise NavReportException, so Report.SaveAs reports the single "RDLC report rendering is
+    // not implemented on Linux BC" message on every version (issue #109).
+    private static Type? _reportingClientIface;
+
+    private static void TryHookInitReportingClient(Assembly navNcl)
+    {
+        Type? sessionType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavSession");
+        var init = sessionType?.GetMethod("InitReportingClientAsync",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+        if (init == null)
+        {
+            Console.WriteLine("[StartupHook] Patch #19: neither CustomReportingServiceClient nor NavSession.InitReportingClientAsync found");
+            return;
+        }
+
+        string baseDir = AppDomain.CurrentDomain.BaseDirectory ?? "";
+        string clientDll = Path.Combine(baseDir, "Microsoft.BusinessCentral.Reporting.Client.dll");
+        if (!File.Exists(clientDll))
+            clientDll = Path.Combine(baseDir, "SideServices", "Microsoft.BusinessCentral.Reporting.Client.dll");
+        if (!File.Exists(clientDll))
+        {
+            Console.WriteLine($"[StartupHook] Patch #19b: {clientDll} not found");
+            return;
+        }
+        Type? iClientType = Assembly.LoadFrom(clientDll)
+            .GetType("Microsoft.BusinessCentral.Reporting.Client.IReportingServiceClient");
+        if (iClientType == null)
+        {
+            Console.WriteLine("[StartupHook] Patch #19b: IReportingServiceClient type not found");
+            return;
+        }
+
+        _reportingClientIface = iClientType;
+        _noopReportingClient = typeof(System.Reflection.DispatchProxy)
+            .GetMethod("Create", 2, Type.EmptyTypes)!
+            .MakeGenericMethod(iClientType, typeof(NoOpReportingProxy))
+            .Invoke(null, null);
+
+        var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_InitReportingClientAsync),
+            BindingFlags.Public | BindingFlags.Static)!;
+        ApplyJmpHook(init, replacement, "NavSession.InitReportingClientAsync");
+        Console.WriteLine("[StartupHook] Patch #19b: NavSession.InitReportingClientAsync → no-op proxy");
+    }
+
+    // Declared `object` rather than Task<IReportingServiceClient>: the interface lives in an
+    // assembly this one cannot reference. Both are a plain object pointer in RAX, which is all
+    // the caller reads. The Task is built reflectively with the real interface as T.
+    public static object Replacement_InitReportingClientAsync(object session)
+    {
+        return typeof(System.Threading.Tasks.Task)
+            .GetMethod(nameof(System.Threading.Tasks.Task.FromResult))!
+            .MakeGenericMethod(_reportingClientIface!)
+            .Invoke(null, new[] { _noopReportingClient })!;
     }
 
     /// <summary>
@@ -1733,6 +2199,115 @@ internal class StartupHook
     }
 
     // ========================================================================
+    // Patch #33: BC hosts several API endpoints on one port, separated by URL path, for
+    // example http://+:7048/BC/ODataV4 and http://+:7048/BC/api/webhooks, or
+    // http://+:7085/BC/client and http://+:7085/BC/client/health. HTTP.SYS routes those by
+    // prefix on a single port. Kestrel cannot bind a port twice, so the second Open()
+    // throws AddressInUseException and the whole NST service start fails, leaving no
+    // listener at all. Observed on BC 30: no 7045, 7047, 7048, 7049 or 7085.
+    // Fix: hand every endpoint after the first on a given port its own port. The primary
+    // endpoints (client, dev, ODataV4) are created first and keep their configured ports;
+    // the auxiliary ones (health, webhooks) move. Each move is logged, so a wrong one is
+    // visible rather than silent. This mirrors what HttpSysStub already does for the hosts
+    // that go through UseHttpSys; these hosts use Kestrel directly and bypass it.
+    internal const int ApiPortOffset = 10000;
+    // ODataServicesPort + 4 is where the REST API's host port is mapped.
+    internal const int ApiPortSpacing = 4;
+    private static readonly Dictionary<string, int> _apiHostPorts = new Dictionary<string, int>();
+    private static readonly HashSet<int> _claimedApiPorts = new HashSet<int>();
+
+    private static void PatchApiHostPorts(Assembly aspNetCoreAsm)
+    {
+        try
+        {
+            // BC 27 to 29 serve these hosts through UseHttpSys, where HttpSysStub already gives
+            // each endpoint its own port (measured on 28.4: listeners on 7050-7055 and 7086-7087).
+            // Moving them here as well would replace those ports with different ones for no
+            // gain, so only BC 30 and later, whose hosts bind Kestrel directly, are patched.
+            var asmVersion = aspNetCoreAsm.GetName().Version;
+            if (asmVersion != null && asmVersion.Major < 30)
+            {
+                Console.WriteLine($"[StartupHook] Patch #33: skipped on {asmVersion} (HttpSysStub already splits the ports before BC 30)");
+                return;
+            }
+            var hostType = aspNetCoreAsm.GetType("Microsoft.Dynamics.Nav.Service.AspNetCore.AspNetCoreApiHost");
+            if (hostType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #33: AspNetCoreApiHost not found");
+                return;
+            }
+
+            var original = hostType.GetMethod("CreateBaseAddress", BindingFlags.Public | BindingFlags.Static);
+            if (original == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #33: CreateBaseAddress not found");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(nameof(CreateBaseAddressReplacement),
+                BindingFlags.NonPublic | BindingFlags.Static);
+            ApplyJmpHook(original, replacement, "AspNetCoreApiHost.CreateBaseAddress");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #33 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Endpoints that sit under a primary endpoint's URL: client/health, api/webhooks,
+    // devhealth, WSHealth, ODataV4Health, mcp. HTTP.SYS served them on the primary's port
+    // by URL prefix; none of them has a published host port.
+    private static bool IsAuxiliaryApiEndpoint(string? name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        string n = name.Trim('/');
+        return n.Contains('/')
+            || n.EndsWith("health", StringComparison.OrdinalIgnoreCase)
+            || n.Equals("mcp", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Uri CreateBaseAddressReplacement(bool useSsl, string machineName, int portNumber,
+        string serverInstance, string name)
+    {
+        // Open() and Resume() both call this for the same host, so the assignment has to be
+        // stable: look it up by endpoint before allocating anything.
+        string key = serverInstance + "/" + name;
+        lock (_apiHostPorts)
+        {
+            int assigned;
+            if (_apiHostPorts.TryGetValue(key, out assigned))
+            {
+                portNumber = assigned;
+            }
+            else
+            {
+                // Auxiliary endpoints (health, webhooks, mcp) are decided by NAME, not by creation
+                // order: they always move, so one created before the client, dev or OData
+                // endpoint can never take that endpoint's configured port.
+                bool auxiliary = IsAuxiliaryApiEndpoint(name);
+                if (auxiliary || !_claimedApiPorts.Add(portNumber))
+                {
+                    // The REST API is a published endpoint: tooling maps a host port to
+                    // ODataServicesPort + 4 for it. Send it there rather than into the
+                    // spare range, or the mapping points at nothing. The auxiliary
+                    // endpoints (health, webhooks, mcp) have no published port, so any
+                    // free one will do.
+                    int moved = !auxiliary && name != null && name.TrimEnd('/').EndsWith("api", StringComparison.OrdinalIgnoreCase)
+                        ? portNumber + ApiPortSpacing
+                        : portNumber + ApiPortOffset;
+                    while (!_claimedApiPorts.Add(moved)) moved++;
+                    Console.WriteLine($"[StartupHook] Patch #33: {key} moved {portNumber} -> {moved} ({(auxiliary ? "auxiliary endpoint" : "port already taken")})");
+                    portNumber = moved;
+                }
+                _apiHostPorts[key] = portNumber;
+            }
+        }
+
+        string scheme = useSsl ? Uri.UriSchemeHttps : Uri.UriSchemeHttp;
+        return new Uri(FormattableString.Invariant(
+            $"{scheme}{Uri.SchemeDelimiter}{machineName}:{portNumber}/{serverInstance}/{name}").TrimEnd('/'));
+    }
+
     // Patch #18: SetupSideServices — skip Reporting Service startup on Linux.
     // The Reporting Service (.exe) is a Windows PE binary. Without this patch,
     // BC crashes with SideServiceProcessException on startup. Making it a no-op
@@ -1867,15 +2442,28 @@ internal class StartupHook
 
             var noop = typeof(StartupHook).GetMethod(nameof(WatsonSendReportNoop),
                 BindingFlags.Static | BindingFlags.NonPublic)!;
+            var sendReportNoop = typeof(StartupHook).GetMethod(nameof(WatsonSendReportSuccess),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
             var noopStr = typeof(StartupHook).GetMethod(nameof(WatsonGetRegistryValueNoop),
                 BindingFlags.Static | BindingFlags.NonPublic)!;
 
             int hooked = 0;
-            // Hook ALL SendReport overloads
+            // Hook ALL SendReport overloads. Pick the replacement by what the overload
+            // returns: SendReport returns WatsonResult (int-backed enum) today, and a void
+            // replacement would leave the caller's switch reading an undefined register.
             foreach (var m in watsonType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
                 .Where(m => m.Name == "SendReport"))
             {
-                ApplyJmpHook(m, noop, $"WatsonReporting.SendReport({m.GetParameters().Length} params)");
+                var replacement = m.ReturnType == typeof(void) ? noop
+                    : m.ReturnType.IsEnum && m.ReturnType.GetEnumUnderlyingType() == typeof(int) ? sendReportNoop
+                    : null;
+                if (replacement == null)
+                {
+                    Console.WriteLine($"[StartupHook] Watson: SendReport({m.GetParameters().Length} params) returns "
+                        + $"{m.ReturnType.Name}, which has no matching no-op — leaving it unhooked.");
+                    continue;
+                }
+                ApplyJmpHook(m, replacement, $"WatsonReporting.SendReport({m.GetParameters().Length} params)");
                 hooked++;
             }
 
@@ -1919,6 +2507,29 @@ internal class StartupHook
     }
 
     private static void WatsonSendReportNoop() { }
+
+    /// <summary>
+    /// Replacement for WatsonReporting.SendReport, which returns
+    /// Microsoft.Dynamics.Nav.Watson.WatsonResult (an int-backed enum), not void.
+    ///
+    /// The void no-op above left the return register holding whatever the previous code
+    /// had put there, and WatsonReporting.SendWatsonReport switches on that value:
+    ///
+    ///     Success (0)          -> return true
+    ///     Debug   (16)         -> return false
+    ///     Unknown (-1), Fail(1)-> throw new WatsonReportException("Watson report failure", exception)
+    ///
+    /// So a garbage register value could make BC's own crash reporter throw, on the path
+    /// that is already handling a crash, at random. Return Success so SendWatsonReport
+    /// reports the crash as filed and does nothing further — Watson cannot work on Linux,
+    /// and the point of the hook is that it stops quietly.
+    ///
+    /// The type is an enum with an int underlying type, so returning int is the correct
+    /// ABI match; the replacement must not reference the BC type directly, because
+    /// ApplyJmpHook JITs it while the assembly is still loading.
+    /// </summary>
+    private static int WatsonSendReportSuccess() => 0; // WatsonResult.Success
+
     private static string? WatsonGetRegistryValueNoop() => null;
 
     private static void PatchNavTypes(Assembly navTypes)
@@ -2569,109 +3180,100 @@ internal class StartupHook
     }
 
     // ========================================================================
-    // Patch #16: Client Services Credential Bypass
-    // ========================================================================
-
-    private static void PatchClientCredentialValidation(Assembly navServiceAssembly)
-    {
-        try
-        {
-            // Patch the validator to not check the password but still populate the auth cache
-            var validatorType = navServiceAssembly.GetType(
-                "Microsoft.Dynamics.Nav.Service.ClientServicesUserNamePasswordValidator");
-            if (validatorType == null)
-            {
-                Console.WriteLine("[StartupHook] Patch #16: Validator type not found, skipping");
-                return;
-            }
-
-            var validateMethod = validatorType.GetMethod("ValidateAsync",
-                BindingFlags.Instance | BindingFlags.Public);
-            if (validateMethod == null)
-            {
-                Console.WriteLine("[StartupHook] Patch #16: ValidateAsync not found, skipping");
-                return;
-            }
-
-            var replacement = typeof(StartupHook).GetMethod(
-                nameof(Replacement_ValidateCredentials),
-                BindingFlags.Static | BindingFlags.NonPublic);
-            ApplyJmpHook(validateMethod, replacement!, "ClientServicesUserNamePasswordValidator.ValidateAsync");
-            Console.WriteLine("[StartupHook] Patch #16: Client credential validation bypassed");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[StartupHook] Patch #16 failed: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Replacement for ClientServicesUserNamePasswordValidator.ValidateAsync.
-    /// Always succeeds — credentials are trusted in pipeline/CI scenarios.
-    /// Signature: instance method, ValueTask ValidateAsync(ConnectionCredentials)
-    /// </summary>
-    private static ValueTask Replacement_ValidateCredentials(object? self, object? credentials)
-    {
-        Console.WriteLine("[StartupHook] Credential validation bypassed (Patch #16)");
-        return ValueTask.CompletedTask;
-    }
-
-    /// <summary>
-    /// Patch NavUser.TryAuthenticate to always return true.
-    /// Called from Nav.Ncl.dll when it's loaded.
-    /// The password hash format from Windows doesn't verify correctly on Linux.
-    /// </summary>
-    internal static void PatchNavUserTryAuthenticate(Assembly nclAssembly)
-    {
-        try
-        {
-            var navUserType = nclAssembly.GetType("Microsoft.Dynamics.Nav.Runtime.NavUser");
-            if (navUserType == null) return;
-
-            // There are multiple TryAuthenticate overloads. Patch the one that takes
-            // (NavUser, UserNameSecurityToken, NavTenant) — the NavUserPassword path.
-            foreach (var m in navUserType.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
-            {
-                if (m.Name != "TryAuthenticate") continue;
-                var ps = m.GetParameters();
-                if (ps.Length == 3 && ps[1].ParameterType.Name.Contains("UserNameSecurityToken"))
-                {
-                    var replacement = typeof(StartupHook).GetMethod(
-                        nameof(Replacement_TryAuthenticate),
-                        BindingFlags.Static | BindingFlags.NonPublic);
-                    ApplyJmpHook(m, replacement!, "NavUser.TryAuthenticate(NavUser,UserNameSecurityToken,NavTenant)");
-                    Console.WriteLine("[StartupHook] Patch #16b: NavUser.TryAuthenticate bypassed");
-                    return;
-                }
-            }
-            Console.WriteLine("[StartupHook] Patch #16b: TryAuthenticate overload not found");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[StartupHook] Patch #16b failed: {ex.Message}");
-        }
-    }
-
-    private static bool Replacement_TryAuthenticate(object? user, object? token, object? tenant)
-    {
-        Console.WriteLine("[StartupHook] NavUser.TryAuthenticate bypassed — returning true (Patch #16b)");
-        return true;
-    }
-
-    // ========================================================================
-    // Patch #21: NavOpenTaskPageAction.ShowForm — no-op on headless Linux runner.
+    // Patch #21: NavOpenTaskPageAction.ShowForm — faithful headless replacement.
     //
-    // When a test method opens a task page, ShowForm is called on the headless
-    // client which has no UI renderer. The resulting NullReferenceException
-    // terminates the entire test session, preventing all subsequent test methods
-    // from executing. Replacing ShowForm with a no-op silently skips task-page
-    // opens so the rest of the test codeunit continues running.
+    // ShowForm is the single point where a task-page open becomes a shown form.
+    // Everything ActionBuilder routes into NavOpenTaskPageAction goes through it:
+    // every action RunObject, the Edit/View/ViewList/OpenInNewWindow menu actions,
+    // the built-in New action, and page views.
+    //
+    // The original patch replaced the method with a no-op, because *something* in
+    // the headless UI layer raised a NullReferenceException that took the whole
+    // test session down. Skipping the call keeps the session alive, but it also
+    // means the target page is built and then never shown — so the client never
+    // raises UISession.FormToShow, TestPageClientSession.UISession_FormToShow never
+    // fires the OnShowFormCallback, and NavTestExecution.ShowForm never runs. The
+    // AL-visible consequences of that are large and silent:
+    //
+    //   * the test's [PageHandler] / [ModalPageHandler] is never looked up or run,
+    //   * NavTestPageInvokedWithoutHandlerException is never raised for an
+    //     unhandled page open,
+    //   * a non-optional handler that never fired is not reported by
+    //     NavTestExecution.TestHandlers, so the test passes having done nothing.
+    //
+    // So the invoke returns normally and the test cannot tell the difference
+    // between "the page opened" and "nothing happened". That makes this container
+    // unable to adjudicate any question about opening a page through an action.
+    //
+    // This replacement re-implements the real body instead (it is byte-identical
+    // on 27.0, 27.5, 28.0 and 28.4 — verified by decompiling all four):
+    //
+    //   private bool ShowForm(LogicalForm childForm, LogicalForm parentForm,
+    //                         UISession uiSession, FormState formState)
+    //   {
+    //       SetThrowRowEntryNotFound(childForm.BindingManager, true);
+    //       var nbm = NavBindingManager.AsNavBindingManager(childForm.BindingManager);
+    //       try {
+    //           if (formState.RunModal) childForm.ShowDialog(parentForm);
+    //           else                    uiSession.ShowForm(childForm, parentForm);
+    //           return true;
+    //       }
+    //       catch (InvalidBookmarkException) { ...HandleRecordNoLongerExists... }
+    //       catch (NavTestBaseException)     { throw; }
+    //       catch (NavBaseException ex)      { ...ShowError, ForceClose... }
+    //       finally { SetThrowRowEntryNotFound(childForm.BindingManager, false); }
+    //       return false;
+    //   }
+    //
+    // Two deliberate differences from the original body, both narrow:
+    //
+    //   1. A NullReferenceException escaping the show call is caught, logged with
+    //      its full stack, and reported as "not shown" (return false) instead of
+    //      propagating. That preserves the one property the old no-op was added
+    //      for — a headless UI failure must not kill the session — while making
+    //      the failure visible instead of invisible. The stack in that log line is
+    //      the thing nobody has ever captured for this patch; if it turns out to be
+    //      fixable, fix it and delete this catch.
+    //   2. Null childForm/uiSession/formState are reported as "not shown" rather
+    //      than dereferenced.
+    //
+    // Everything else — including rethrowing NavTestBaseException, which is what
+    // carries NavTestPageInvokedWithoutHandlerException back to AL — is the real
+    // behaviour.
+    //
+    // Set BC_SHOWFORM_MODE=skip to restore the old unconditional no-op.
+    //
+    // The replacement is declared to return bool. The original returns bool and
+    // InvokeCore does `if (!ShowForm(...)) return null;`; the old void replacement
+    // left the caller reading whatever happened to be in the return register.
+    //
+    // The body reaches BC types by reflection only, never by a typed reference.
+    // ApplyJmpHook calls RuntimeHelpers.PrepareMethod on the replacement at patch
+    // time, so a typed reference here would force those assemblies to load during
+    // the AssemblyLoad callback that installs the patch.
     //
     // Assembly: Microsoft.Dynamics.Nav.Client.UI.dll
     // Namespace: Microsoft.Dynamics.Nav.Client.Actions
-    // Signature: void ShowForm(LogicalForm childForm, LogicalForm parentForm,
+    // Signature: bool ShowForm(LogicalForm childForm, LogicalForm parentForm,
     //                          UISession uiSession, FormState formState)
     // ========================================================================
+
+    private const string InvalidBookmarkExceptionName = "Microsoft.Dynamics.Framework.UI.InvalidBookmarkException";
+    private const string NavTestBaseExceptionName = "Microsoft.Dynamics.Nav.Types.Exceptions.NavTestBaseException";
+    private const string NavBaseExceptionName = "Microsoft.Dynamics.Nav.Types.Exceptions.NavBaseException";
+
+    /// <summary>Declaring type of the hooked ShowForm, captured when the patch is installed.</summary>
+    private static Type? _showFormActionType;
+
+    /// <summary><c>NavBindingManager</c>, resolved from the same assembly as the action type.</summary>
+    private static Type? _navBindingManagerType;
+
+    /// <summary>True once BC_SHOWFORM_MODE has been read.</summary>
+    private static bool _showFormSkipMode;
+
+    /// <summary>BC_SHOWFORM_TRACE=1 — log every call and how it ended. Off by default; a
+    /// task-page open is common enough that tracing it unconditionally would be noise.</summary>
+    private static bool _showFormTrace;
 
     private static void PatchShowForm(Assembly navClientUi)
     {
@@ -2692,11 +3294,28 @@ internal class StartupHook
                 return;
             }
 
+            // The real method returns bool and InvokeCore branches on it. If a future BC
+            // build changes that, a bool-returning replacement would be writing a return
+            // value the caller does not expect — refuse rather than guess.
+            if (showForm.ReturnType != typeof(bool))
+            {
+                Console.WriteLine($"[StartupHook] Patch #21: ShowForm returns {showForm.ReturnType.Name}, expected Boolean — skipping");
+                return;
+            }
+
+            _showFormActionType = actionType;
+            _navBindingManagerType = navClientUi.GetType("Microsoft.Dynamics.Nav.Client.DataBinder.NavBindingManager");
+            _showFormSkipMode = string.Equals(
+                Environment.GetEnvironmentVariable("BC_SHOWFORM_MODE"), "skip", StringComparison.OrdinalIgnoreCase);
+            _showFormTrace = Environment.GetEnvironmentVariable("BC_SHOWFORM_TRACE") == "1";
+
             var replacement = typeof(StartupHook).GetMethod(
                 nameof(Replacement_ShowForm),
                 BindingFlags.Static | BindingFlags.NonPublic)!;
             ApplyJmpHook(showForm, replacement, "NavOpenTaskPageAction.ShowForm");
-            Console.WriteLine("[StartupHook] Patch #21: NavOpenTaskPageAction.ShowForm hooked (no-op on Linux)");
+            Console.WriteLine(_showFormSkipMode
+                ? "[StartupHook] Patch #21: NavOpenTaskPageAction.ShowForm hooked (BC_SHOWFORM_MODE=skip — no-op)"
+                : "[StartupHook] Patch #21: NavOpenTaskPageAction.ShowForm hooked (faithful headless show)");
         }
         catch (Exception ex)
         {
@@ -2705,24 +3324,281 @@ internal class StartupHook
     }
 
     /// <summary>
-    /// No-op replacement for NavOpenTaskPageAction.ShowForm.
-    /// ShowForm is an instance method so JMP hooks pass 'this' as the first explicit parameter,
-    /// followed by the declared parameters (childForm, parentForm, uiSession, formState).
-    /// Silently dropping the call prevents NullReferenceException in the headless UI layer
-    /// and lets test sessions continue past task-page opens.
+    /// Replacement for NavOpenTaskPageAction.ShowForm. ShowForm is an instance method so
+    /// JMP hooks pass 'this' as the first explicit parameter, followed by the declared
+    /// parameters (childForm, parentForm, uiSession, formState).
+    /// Returns true when the form was shown, matching the original's contract.
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void Replacement_ShowForm(object self, object? childForm, object? parentForm, object? uiSession, object? formState)
+    private static bool Replacement_ShowForm(object self, object? childForm, object? parentForm, object? uiSession, object? formState)
     {
-        Console.WriteLine("[StartupHook] Patch #21: NavOpenTaskPageAction.ShowForm skipped (no headless UI on Linux)");
+        if (_showFormSkipMode)
+        {
+            Console.WriteLine("[StartupHook] Patch #21: ShowForm skipped (BC_SHOWFORM_MODE=skip)");
+            return false;
+        }
+
+        if (childForm == null || uiSession == null || formState == null)
+        {
+            Console.WriteLine("[StartupHook] Patch #21: ShowForm called with a null form/session/state — reporting 'not shown'");
+            return false;
+        }
+
+        object? childBindingManager = ShowFormGetProperty(childForm, "BindingManager");
+        ShowFormSetThrowRowEntryNotFound(self, childBindingManager, throwException: true);
+        try
+        {
+            try
+            {
+                bool runModal = ShowFormGetProperty(formState, "RunModal") is bool b && b;
+                if (_showFormTrace)
+                    Console.WriteLine($"[StartupHook] Patch #21 trace: showing form (runModal={runModal})");
+                if (runModal)
+                    ShowFormInvoke(childForm, "ShowDialog", new[] { parentForm });
+                else
+                    ShowFormInvoke(uiSession, "ShowForm", new[] { childForm, parentForm });
+                if (_showFormTrace)
+                    Console.WriteLine("[StartupHook] Patch #21 trace: shown, returning true");
+                return true;
+            }
+            catch (Exception ex) when (ShowFormIsA(ex, InvalidBookmarkExceptionName))
+            {
+                if (ShowFormHandleInvalidBookmark(self, childBindingManager, parentForm))
+                    return true;
+            }
+            catch (Exception ex) when (ShowFormIsA(ex, NavTestBaseExceptionName))
+            {
+                // Carries NavTestPageInvokedWithoutHandlerException — the AL-visible
+                // "you opened a page with no handler" error. Must reach the test.
+                if (_showFormTrace)
+                    Console.WriteLine($"[StartupHook] Patch #21 trace: rethrowing {ex.GetType().FullName}: {ex.Message}");
+                throw;
+            }
+            catch (Exception ex) when (ShowFormIsA(ex, NavBaseExceptionName))
+            {
+                if (_showFormTrace)
+                    Console.WriteLine($"[StartupHook] Patch #21 trace: NavBaseException {ex.GetType().FullName}: {ex.Message}");
+                ShowFormReportNavBaseException(childForm, ex);
+            }
+            catch (NullReferenceException nre)
+            {
+                // The failure Patch #21 was originally created for. Nobody ever captured
+                // where it comes from; this is that capture. Swallowing it keeps the
+                // session alive, which is the whole reason the patch exists.
+                Console.WriteLine("[StartupHook] Patch #21: ShowForm raised NullReferenceException in the headless UI layer — "
+                    + "reporting 'not shown' so the session survives. Full exception follows:");
+                Console.WriteLine(nre.ToString());
+            }
+        }
+        finally
+        {
+            ShowFormSetThrowRowEntryNotFound(self, childBindingManager, throwException: false);
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// NavOpenTaskPageAction.SetThrowRowEntryNotFound(BindingManager, bool) — private instance.
+    /// A failure here is logged, never thrown: it only toggles bookmark strictness and must
+    /// not turn into a second failure on top of the one being handled.
+    /// </summary>
+    private static void ShowFormSetThrowRowEntryNotFound(object self, object? bindingManager, bool throwException)
+    {
+        try
+        {
+            var m = _showFormActionType?.GetMethod("SetThrowRowEntryNotFound",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            m?.Invoke(self, new object?[] { bindingManager, throwException });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #21: SetThrowRowEntryNotFound({throwException}) failed: "
+                + $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// The original's catch (InvalidBookmarkException) branch: ask the child binding manager
+    /// whether it can recover from the parent's now-stale bookmark.
+    /// </summary>
+    private static bool ShowFormHandleInvalidBookmark(object self, object? childBindingManager, object? parentForm)
+    {
+        try
+        {
+            object? childNbm = ShowFormAsNavBindingManager(childBindingManager);
+            if (childNbm == null)
+                return false;
+
+            object? parentNbm = ShowFormAsNavBindingManager(ShowFormGetProperty(parentForm, "BindingManager"));
+            object? requestedBookmark = parentNbm == null ? null : ShowFormGetProperty(parentNbm, "CurrentBookmark");
+
+            // ViewMode != PageMode.Delete
+            object? viewMode = ShowFormGetProperty(self, "ViewMode");
+            bool notDeleting = true;
+            if (viewMode != null)
+            {
+                var deleteValue = Enum.Parse(viewMode.GetType(), "Delete");
+                notDeleting = !viewMode.Equals(deleteValue);
+            }
+
+            var m = childNbm.GetType()
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy)
+                .FirstOrDefault(c => c.Name == "HandleRecordNoLongerExists" && c.GetParameters().Length == 2);
+            if (m == null)
+                return false;
+            return ShowFormUnwrap(() => m.Invoke(childNbm, new object?[] { requestedBookmark, notDeleting })) is bool b && b;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #21: InvalidBookmarkException recovery failed: "
+                + $"{ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The original's catch (NavBaseException) branch: show the error unless the exception
+    /// suppresses it, then force-close the form.
+    /// </summary>
+    private static void ShowFormReportNavBaseException(object childForm, Exception ex)
+    {
+        try
+        {
+            bool suppress = ShowFormGetProperty(ex, "SuppressMessage") is bool s && s;
+            if (!suppress)
+            {
+                object? formUiSession = ShowFormGetProperty(childForm, "UISession");
+                object? messageHelper = ShowFormGetProperty(formUiSession, "MessageHelper");
+                if (messageHelper != null)
+                {
+                    var showError = messageHelper.GetType()
+                        .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        .FirstOrDefault(m => m.Name == "ShowError" && m.GetParameters().Length == 2);
+                    showError?.Invoke(messageHelper, new object?[] { ex, true });
+                }
+            }
+
+            var close = childForm.GetType()
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy)
+                .FirstOrDefault(c => c.Name == "Close"
+                                  && c.GetParameters().Length == 1
+                                  && c.GetParameters()[0].ParameterType.IsEnum);
+            if (close != null)
+                close.Invoke(childForm, new[] { Enum.Parse(close.GetParameters()[0].ParameterType, "ForceClose") });
+        }
+        catch (Exception inner)
+        {
+            Console.WriteLine($"[StartupHook] Patch #21: NavBaseException handling failed: "
+                + $"{inner.GetType().Name}: {inner.Message} (original: {ex.GetType().Name}: {ex.Message})");
+        }
+    }
+
+    /// <summary>NavBindingManager.AsNavBindingManager(BindingManager) — static, returns null on a mismatch.</summary>
+    private static object? ShowFormAsNavBindingManager(object? bindingManager)
+    {
+        if (bindingManager == null || _navBindingManagerType == null)
+            return null;
+        // Two single-argument overloads exist — AsNavBindingManager(BindingManager) and
+        // AsNavBindingManager(Binder) — and BindingManager derives from Binder, so both
+        // accept the argument. Pick the most derived one rather than whichever GetMethods
+        // happens to return first. (They agree either way: the Binder overload delegates to
+        // the BindingManager one. The point is not to depend on that.)
+        MethodInfo? m = null;
+        foreach (var c in _navBindingManagerType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            if (c.Name != "AsNavBindingManager" || c.GetParameters().Length != 1)
+                continue;
+            Type candidate = c.GetParameters()[0].ParameterType;
+            if (!candidate.IsInstanceOfType(bindingManager))
+                continue;
+            if (m == null || m.GetParameters()[0].ParameterType.IsAssignableFrom(candidate))
+                m = c;
+        }
+        if (m == null)
+            return null;
+        return ShowFormUnwrap(() => m.Invoke(null, new[] { bindingManager }));
+    }
+
+    private static object? ShowFormGetProperty(object? target, string name)
+    {
+        if (target == null)
+            return null;
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy;
+        PropertyInfo? p;
+        try
+        {
+            p = target.GetType().GetProperty(name, flags);
+        }
+        catch (AmbiguousMatchException)
+        {
+            // A `new` re-declaration in a derived type. The most-derived one wins.
+            p = target.GetType().GetProperties(flags).FirstOrDefault(x => x.Name == name);
+        }
+        if (p == null || !p.CanRead)
+            return null;
+        return ShowFormUnwrap(() => p.GetValue(target));
+    }
+
+    /// <summary>
+    /// Invoke a one- or two-argument instance method by name, propagating the real exception
+    /// rather than the TargetInvocationException wrapper so the catch ladder above matches
+    /// the same exception types the original method matched.
+    /// </summary>
+    private static void ShowFormInvoke(object target, string name, object?[] args)
+    {
+        var m = target.GetType()
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy)
+            .FirstOrDefault(c => c.Name == name && c.GetParameters().Length == args.Length);
+        if (m == null)
+            throw new MissingMethodException(target.GetType().FullName, name);
+        ShowFormUnwrap(() => m.Invoke(target, args));
+    }
+
+    /// <summary>
+    /// Run a reflection call and rethrow its inner exception with the original stack, so the
+    /// exception filters above see the exception BC actually threw.
+    /// </summary>
+    private static object? ShowFormUnwrap(Func<object?> call)
+    {
+        try
+        {
+            return call();
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+            throw; // unreachable
+        }
+    }
+
+    /// <summary>True when <paramref name="ex"/> is, or derives from, the named type.</summary>
+    private static bool ShowFormIsA(Exception ex, string fullTypeName)
+    {
+        for (Type? t = ex.GetType(); t != null; t = t.BaseType)
+        {
+            if (t.FullName == fullTypeName)
+                return true;
+        }
+        return false;
     }
 
     // ========================================================================
     // Patch #22: AzureADGraphQuery constructor bypass
     // ========================================================================
 
+    // AzureADGraphQuery.currentSession (private readonly field) — set via reflection
+    // by the replacement ctor below so post-construction calls that don't go through
+    // GetTenantDetail (see below) don't NRE on it either.
+    private static FieldInfo? _aadgqCurrentSessionField;
+
     private static void PatchAzureADGraphQuery(Assembly navNcl)
     {
+        // Patch #22b is independent of Patch #22's own success (it fixes a completely
+        // separate call path — see PatchGraphQueryGetTenantDetail's header comment) and
+        // MUST run even if any of the early returns below fire (e.g. a future BC version
+        // renaming/moving AzureADGraphQuery). Use try/finally rather than relying on
+        // "falls through to the bottom" — every `return` inside the try used to skip the
+        // call entirely, silently reintroducing the misleading SUPER-user error.
         try
         {
             var queryType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.AzureADGraphQuery");
@@ -2750,6 +3626,19 @@ internal class StartupHook
                 return;
             }
 
+            _aadgqCurrentSessionField = queryType.GetField("currentSession",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            if (_aadgqCurrentSessionField == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #22: AzureADGraphQuery.currentSession field not found — skipping ctor fix (GetTenantDetail fix below is independent)");
+            }
+
+            // NavCurrentThread.Session accessor is shared with Patch #27/#28; resolve if
+            // neither ran first (load order between patches is not guaranteed).
+            _navCurrentThreadSessionProp ??= navNcl
+                .GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread")
+                ?.GetProperty("Session", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
             var replacement = typeof(StartupHook).GetMethod(
                 nameof(Replacement_AzureADGraphQueryCtor),
                 BindingFlags.Static | BindingFlags.NonPublic)!;
@@ -2760,20 +3649,180 @@ internal class StartupHook
         {
             Console.WriteLine($"[StartupHook] Patch #22 failed: {ex.GetType().Name}: {ex.Message}");
         }
+        finally
+        {
+            PatchGraphQueryGetTenantDetail(navNcl);
+        }
     }
 
     /// <summary>
     /// No-op replacement for AzureADGraphQuery..ctor(NavSession session).
     /// Skips LazyEx factory setup that requires Azure.Identity / MSAL Windows credential APIs.
-    /// The object is heap-allocated before this ctor runs, so all fields remain default (null/0).
-    /// Tests that reach this path don't need real Azure AD calls — they just need the
-    /// GraphQuery DotNet object to be created without crashing the session.
+    /// The object is heap-allocated before this ctor runs, so all fields remain default (null/0)
+    /// EXCEPT currentSession, which this replacement sets explicitly via reflection so any
+    /// OTHER GraphQuery method than GetTenantDetail (see PatchGraphQueryGetTenantDetail below)
+    /// doesn't immediately NRE on a null currentSession.Diagnostics dereference.
+    ///
+    /// This alone is NOT sufficient to fix GetTenantDetail: the actual runtime call path for
+    /// AL's "GraphQuery" DotNet variable is Microsoft.Dynamics.Nav.AzureADGraphClient.GraphQuery
+    /// (a separate wrapper class in Add-ins/GraphClient/*.dll, not this AzureADGraphQuery),
+    /// whose own parameterless constructor ALWAYS builds
+    /// `azureADGraphQuery = new AzureADGraphQuery((NavSession)null)` regardless of what session
+    /// is actually current — so the session this ctor patch resolves is immediately discarded by
+    /// that caller anyway. See PatchGraphQueryGetTenantDetail for the fix that actually matters.
+    ///
+    /// Session is resolved the same way Patch #27 already resolves it (NavCurrentThread.Session).
     /// Signature: instance ctor → JMP hook passes (this, NavSession) as (object, object).
     /// </summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void Replacement_AzureADGraphQueryCtor(object self, object? session)
     {
+        try
+        {
+            var resolvedSession = session ?? _navCurrentThreadSessionProp?.GetValue(null);
+            _aadgqCurrentSessionField?.SetValue(self, resolvedSession);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #22: failed to set currentSession: {ex.GetType().Name}: {ex.Message}");
+        }
         Console.WriteLine("[StartupHook] Patch #22: AzureADGraphQuery..ctor skipped (no Azure AD on Linux)");
+    }
+
+    // ========================================================================
+    // Patch #22b: GraphQuery.GetTenantDetail — return an empty TenantInfo directly.
+    //
+    // The AL DotNet variable "GraphQuery" (Microsoft.Dynamics.Nav.AzureADGraphClient.GraphQuery,
+    // NOT the AzureADGraphQuery patched above) always constructs its inner AzureADGraphQuery
+    // with a null NavSession (decompiled: `azureADGraphQuery = new AzureADGraphQuery((NavSession)null)`
+    // in GraphQuery's own parameterless ctor) — so Patch #22's ctor fix, which sets currentSession
+    // on THAT inner object, never even runs for this call path (the ctor overload it hooks takes
+    // an explicit NavSession argument; the null-literal call site is a different overload/path).
+    //
+    // GetTenantDetailAsync (the method actually reached) unconditionally dereferences
+    // currentSession.Diagnostics at its very first line for a timing scope, before any of its own
+    // "no AAD tenant configured, use an empty TenantInfo" fallback logic runs. With currentSession
+    // null, that first dereference throws a NullReferenceException. BC's extension-install pipeline
+    // then reports this as the generic, misleading "You must assign at least one user the SUPER
+    // permission set and configure that user to log in with authentication type 'NavUserPassword'"
+    // error — that message is BC's fallback for ANY failed install-transaction commit, not actually
+    // about SUPER/NavUserPassword. Reproduced live: Continia OPplus's own install codeunit calls
+    // Microsoft's IsPlanAssignedToUser, which reaches exactly this NRE via
+    // GraphQuery.GetTenantDetail → AzureADGraphQuery.GetTenantDetailAsync.
+    //
+    // Fix: hook GraphQuery.GetTenantDetail() itself — NOT GetTenantDetailAsync, which is `async`
+    // and reached from a compiler-generated state machine; JMP-hooking an async method mid-flight
+    // is exactly the "AccessViolationException" hazard Patch #20's own comment on EnsureAlive
+    // warns about. GetTenantDetail() is the plain synchronous public wrapper
+    // (`return GetTenantDetailAsync().AsTask().GetAwaiter().GetResult();`) that AL's DotNet
+    // variable calls into, so hooking it is as safe as the ordinary instance-method hooks used
+    // throughout this file. Tests/installs that reach this path don't need a real Azure AD
+    // tenant — they only need SOME non-throwing TenantInfo, which is what Microsoft's own
+    // fallback (AzureADGraphQuery.CreateEmptyTenantInfo, confirmed via decompilation) already
+    // returns for a tenant with no AAD tenant id configured. This patch produces the equivalent
+    // object directly, without depending on that internal fallback ever being reached.
+    // ========================================================================
+
+    private static Type? _tenantInfoType;
+
+    private static void PatchGraphQueryGetTenantDetail(Assembly navNcl)
+    {
+        if (IsPatchDisabled("22b")) return;
+        try
+        {
+            // GraphQuery lives in Add-ins/GraphClient/Microsoft.Dynamics.Nav.AzureADGraphClient.dll,
+            // a SEPARATE assembly from Nav.Ncl.dll (the navNcl parameter here) — it is loaded lazily,
+            // on first AL DotNet variable creation of "GraphQuery", not at NST startup. Resolve it via
+            // AppDomain.CurrentDomain.GetAssemblies() at patch time (called from the same
+            // AssemblyLoad callback as Patch #22, so may run before or after that assembly is loaded);
+            // if not yet loaded, register interest and patch it when it does load instead.
+            var graphClientAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Microsoft.Dynamics.Nav.AzureADGraphClient");
+
+            if (graphClientAssembly == null)
+            {
+                // Not loaded yet — the AssemblyLoad handler in Initialize() re-invokes this same
+                // patch by name once it does load (see the dedicated hook registered there).
+                Console.WriteLine("[StartupHook] Patch #22b: Microsoft.Dynamics.Nav.AzureADGraphClient not yet loaded — will retry when it loads");
+                return;
+            }
+
+            ApplyGraphQueryGetTenantDetailPatch(graphClientAssembly);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #22b failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static bool _graphQueryPatchApplied;
+
+    private static void ApplyGraphQueryGetTenantDetailPatch(Assembly graphClientAssembly)
+    {
+        if (_graphQueryPatchApplied) return;
+        try
+        {
+            var graphQueryType = graphClientAssembly.GetType("Microsoft.Dynamics.Nav.AzureADGraphClient.GraphQuery");
+            if (graphQueryType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #22b: GraphQuery type not found — skipping");
+                return;
+            }
+
+            var getTenantDetail = graphQueryType.GetMethod("GetTenantDetail",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null, types: Type.EmptyTypes, modifiers: null);
+            if (getTenantDetail == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #22b: GraphQuery.GetTenantDetail() not found — skipping");
+                return;
+            }
+
+            _tenantInfoType = getTenantDetail.ReturnType;
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_GraphQueryGetTenantDetail),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(getTenantDetail, replacement, "GraphQuery.GetTenantDetail");
+            _graphQueryPatchApplied = true;
+            Console.WriteLine("[StartupHook] Patch #22b: GraphQuery.GetTenantDetail hooked — returns an empty TenantInfo without touching Azure AD");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #22b failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replacement for GraphQuery.GetTenantDetail() — instance method, synchronous,
+    /// returns TenantInfo (Microsoft.Dynamics.Nav.LicensingService.Model.TenantInfo).
+    /// Builds an empty TenantInfo directly via reflection (all string properties set to
+    /// string.Empty), matching AzureADGraphQuery.CreateEmptyTenantInfo's own shape for a
+    /// tenant with no AAD tenant id configured — but without depending on that internal
+    /// fallback path (which requires currentSession to be non-null first; see Patch #22's
+    /// header comment for why it never was, for this specific call path).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object? Replacement_GraphQueryGetTenantDetail(object self)
+    {
+        try
+        {
+            if (_tenantInfoType == null) return null;
+            var tenantInfo = Activator.CreateInstance(_tenantInfoType);
+            foreach (var prop in _tenantInfoType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (prop.PropertyType == typeof(string) && prop.CanWrite)
+                {
+                    prop.SetValue(tenantInfo, string.Empty);
+                }
+            }
+            return tenantInfo;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #22b: failed to build empty TenantInfo: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
     }
 
     // ========================================================================
@@ -2781,9 +3830,26 @@ internal class StartupHook
     // See header comment for the full story.
     // ========================================================================
 
+    // Opt-in since the real cause was found (issue #66). AL encryption on this tier
+    // failed because the CRONUS demo backup ships its single [$ndo$tenantproperty]
+    // row with a BLANK tenantid while the NST runs tenant 'default', so every
+    // tenant-property write matched zero rows and CreateKey() could not remember the
+    // key file it had just written. scripts/entrypoint.sh now sets that tenantid, and
+    // with it real RSA encryption works — measured on BC 28.4: EnableEncryption
+    // succeeds and EncryptText returns real ciphertext, not the 16 bytes this proxy
+    // hands back. Set BC_FAKE_ENCRYPTION=1 to restore the pass-through proxy.
+    private static bool FakeEncryptionRequested =>
+        Environment.GetEnvironmentVariable("BC_FAKE_ENCRYPTION") == "1";
+
     private static void PatchTenantEncryptionProvider(Assembly navNcl)
     {
         if (IsPatchDisabled("26")) return;
+        if (!FakeEncryptionRequested)
+        {
+            Console.WriteLine("[StartupHook] Patch #26: skipped — real tenant encryption is used " +
+                              "(set BC_FAKE_ENCRYPTION=1 for the pass-through proxy)");
+            return;
+        }
         try
         {
             var factoryType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Encryption.TenantEncryptionProviderFactory");
@@ -3161,6 +4227,10 @@ internal class StartupHook
 
     private static PropertyInfo? _sessionUserFolderProp;   // NavSession.UserFolder
     private static bool _expandFileNameLockdownLogged;
+    // Issue #189: expanded path -> the text AL passed, for the error text of a failed file call.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _expandedFrom = new();
+    private static FieldInfo? _exceptionMessageField;
+    private const string MissingPathPrefix = "Could not find a part of the path '";
 
     private static void PatchNavFileExpandFileName(Assembly navNcl)
     {
@@ -3205,6 +4275,8 @@ internal class StartupHook
                 nameof(Replacement_NavFileExpandFileName),
                 BindingFlags.Static | BindingFlags.NonPublic)!;
             ApplyJmpHook(expand, replacement, "NavFile.ExpandFileName (Patch #28)");
+            _exceptionMessageField = typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
+            AppDomain.CurrentDomain.FirstChanceException += RewriteMissingPathMessage;
             Console.WriteLine("[StartupHook] Patch #28: NavFile.ExpandFileName backslash normalization active");
         }
         catch (Exception ex)
@@ -3226,6 +4298,7 @@ internal class StartupHook
     private static string Replacement_NavFileExpandFileName(int errorLevel, string fileName, bool enforceUserPath)
     {
         if (string.IsNullOrEmpty(fileName)) return fileName;
+        var originalName = fileName;
         fileName = fileName.Replace('\\', '/');
         try
         {
@@ -3243,17 +4316,25 @@ internal class StartupHook
             if (!System.IO.Path.IsPathRooted(fileName) && userFolder != null)
                 fileName = System.IO.Path.Combine(userFolder, fileName);
             fileName = System.IO.Path.GetFullPath(fileName);
+            if (!string.Equals(originalName, fileName, StringComparison.Ordinal))
+            {
+                if (_expandedFrom.Count > 512) _expandedFrom.Clear();
+                _expandedFrom[fileName] = originalName;
+            }
 
             // BC builds user-folder subpaths with '\' too (GetUserTempFolder combines
             // "TEMP\\"), so pre-#28 the "directories" were literal backslash-named files
-            // and nothing ever created them as real directories. For normalized paths
-            // under the user folder, materialize the parent so temp-file creation works.
+            // and nothing ever created them as real directories. The user's TEMP folder
+            // always exists on a Windows tier, so it is made here. No deeper folder is made: a
+            // write into a missing folder fails as on Windows, with the path as AL passed it in
+            // the text (RewriteMissingPathMessage, issue #189), and creating a parent for every
+            // path made File.Exists on a missing folder create the folder (issue #185).
             if (userFolder != null
                 && fileName.StartsWith(userFolder, StringComparison.OrdinalIgnoreCase))
             {
-                var dir = System.IO.Path.GetDirectoryName(fileName);
-                if (!string.IsNullOrEmpty(dir) && !System.IO.Directory.Exists(dir))
-                    System.IO.Directory.CreateDirectory(dir);
+                var temp = System.IO.Path.Combine(userFolder, "TEMP");
+                if (!System.IO.Directory.Exists(temp))
+                    System.IO.Directory.CreateDirectory(temp);
             }
 
             if (!_expandFileNameLockdownLogged && enforceUserPath)
@@ -3270,6 +4351,493 @@ internal class StartupHook
         return fileName;
     }
 
+    /// <summary>
+    /// Windows names the path as AL passed it in "Could not find a part of the path '...'." (issue
+    /// #189); here .NET names the path after Patch #28 normalized it. The text is rewritten when the
+    /// exception is thrown, before BC reads it. Only paths Patch #28 expanded are touched.
+    /// </summary>
+    private static void RewriteMissingPathMessage(object? sender, System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs e)
+    {
+        try
+        {
+            if (e.Exception is not DirectoryNotFoundException || _exceptionMessageField == null) return;
+            var message = e.Exception.Message;
+            if (!message.StartsWith(MissingPathPrefix, StringComparison.Ordinal) || !message.EndsWith("'.", StringComparison.Ordinal))
+                return;
+            var path = message.Substring(MissingPathPrefix.Length, message.Length - MissingPathPrefix.Length - 2);
+            if (_expandedFrom.TryGetValue(path, out var passed))
+                _exceptionMessageField.SetValue(e.Exception, MissingPathPrefix + passed + "'.");
+        }
+        catch { /* never let the rewrite throw */ }
+    }
+
+    // ========================================================================
+    // Patch #39: Microsoft.Dynamics.Nav.Timer.OnTimerElapsed (issue #136)
+    // ========================================================================
+    // The Timer add-in raises Elapsed on a thread-pool thread. When the AL trigger fails
+    // and RedirectExceptions is false, OnTimerElapsed rethrows (`else if (timer != null)
+    // throw;`), and an exception that leaves a thread-pool callback ends the process: the
+    // whole NST stopped with rc=134 here, measured on BC 28.5. On Windows (BC 27.5 and 29.0)
+    // the same test runs to the end, Elapsed fired and ExceptionOccurred did not. Why
+    // Windows survives the rethrow was not determined. The replacement is the same body
+    // without the rethrow: the error is already logged by BC's interop event handler, a
+    // RedirectExceptions timer still raises ExceptionOccurred, and nothing else changes.
+
+    private static FieldInfo? _timerElapsedField;      // m_Elapsed
+    private static PropertyInfo? _timerRedirectProp;   // RedirectExceptions
+    private static MethodInfo? _timerOnRedirect;       // OnRedirectException(Exception)
+
+    private static void PatchNavTimerElapsed(Assembly timerAsm)
+    {
+        if (IsPatchDisabled("39")) return;
+        try
+        {
+            var timerType = timerAsm.GetType("Microsoft.Dynamics.Nav.Timer");
+            const BindingFlags inst = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var original = timerType?.GetMethod("OnTimerElapsed", inst, null, Type.EmptyTypes, null);
+            _timerElapsedField = timerType?.GetField("m_Elapsed", inst)
+                ?? timerType?.GetField("Elapsed", inst);
+            _timerRedirectProp = timerType?.GetProperty("RedirectExceptions", inst);
+            _timerOnRedirect = timerType?.GetMethod("OnRedirectException", inst, null, new[] { typeof(Exception) }, null);
+            if (original == null || _timerElapsedField == null || _timerRedirectProp == null || _timerOnRedirect == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #39: Microsoft.Dynamics.Nav.Timer shape changed — skipping");
+                return;
+            }
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_TimerOnTimerElapsed),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "Microsoft.Dynamics.Nav.Timer.OnTimerElapsed (Patch #39)");
+            Console.WriteLine("[StartupHook] Patch #39: Timer.OnTimerElapsed no longer rethrows onto the thread pool");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #39 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void Replacement_TimerOnTimerElapsed(object self)
+    {
+        if (_timerElapsedField!.GetValue(self) is not Delegate elapsed) return;
+        try
+        {
+            elapsed.DynamicInvoke(self, new EventArgs());
+        }
+        catch (Exception ex)
+        {
+            var error = ex is TargetInvocationException { InnerException: not null } tie ? tie.InnerException! : ex;
+            try
+            {
+                if (_timerRedirectProp!.GetValue(self) is true)
+                {
+                    _timerOnRedirect!.Invoke(self, new object[] { error });
+                    return;
+                }
+            }
+            catch (Exception redirectEx)
+            {
+                error = redirectEx is TargetInvocationException { InnerException: not null } rtie ? rtie.InnerException! : redirectEx;
+            }
+            Console.WriteLine($"[StartupHook] Patch #39: Timer Elapsed handler failed, not rethrown: {error.GetType().Name}: {error.Message}");
+        }
+    }
+
+    // ========================================================================
+    // Patch #40: NavMediaImageSkia.Bytes (Nav.Ncl.dll, BC 29) — issue #135
+    // ========================================================================
+    // BC 29 takes a different media path when OperatingSystem.IsWindows() is false:
+    // NavMediaFactory.ProcessMediaObject builds a NavMediaImageSkia, whose Bytes() returns
+    // the imported bytes. On Windows the same import goes through NavMediaImage, which
+    // re-encodes the image with GDI+. So BC 29 kept a PNG's bytes here and re-encoded them
+    // on Windows. The replacement hands a PNG to DrawingStub's GdiPlusPng (the same
+    // encoder BC 27 and 28 reach through NavMediaImage.Bytes) and returns the source bytes
+    // for anything it does not handle, as before.
+
+    private static FieldInfo? _skiaSourceBytesField;
+    private static MethodInfo? _gdiPlusPngReencode;
+    private static bool _gdiPlusPngProbed;
+
+    private static void PatchNavMediaImageSkiaBytes(Assembly navNcl)
+    {
+        if (IsPatchDisabled("40")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Media.NavMediaImageSkia");
+            if (type == null) return; // BC 27/28: no such class, NavMediaImage.Bytes reaches DrawingStub
+            const BindingFlags inst = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var original = type.GetMethod("Bytes", inst, null, Type.EmptyTypes, null);
+            _skiaSourceBytesField = type.GetField("sourceBytes", inst);
+            if (original == null || original.ReturnType != typeof(byte[]) || _skiaSourceBytesField == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #40: NavMediaImageSkia shape changed — skipping");
+                return;
+            }
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_NavMediaImageSkiaBytes),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "NavMediaImageSkia.Bytes (Patch #40)");
+            Console.WriteLine("[StartupHook] Patch #40: NavMediaImageSkia.Bytes re-encodes PNG as GDI+ does");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #40 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static byte[] Replacement_NavMediaImageSkiaBytes(object self)
+    {
+        var source = (byte[])_skiaSourceBytesField!.GetValue(self)!;
+        try
+        {
+            if (!_gdiPlusPngProbed)
+            {
+                _gdiPlusPngReencode = Type.GetType("System.Drawing.GdiPlusPng, System.Drawing.Common")
+                    ?.GetMethod("TryReencode", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                _gdiPlusPngProbed = true;
+                if (_gdiPlusPngReencode == null)
+                    Console.WriteLine("[StartupHook] Patch #40: DrawingStub GdiPlusPng not found — media bytes pass through");
+            }
+            if (_gdiPlusPngReencode?.Invoke(null, new object[] { source }) is byte[] reencoded)
+                return reencoded;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #40: re-encode failed: {ex.GetType().Name}: {ex.Message}");
+        }
+        return source;
+    }
+
+    // ========================================================================
+    // Patch #42: NavMediaImageSkia.DecodeBitmapOrThrow (Nav.Ncl.dll, BC 29) — issue #161
+    // ========================================================================
+    // Media.ImportStream on BC 29 probes the image with SKCodec (header only) and then
+    // decodes it with SKBitmap.Decode to build the thumbnail. A PNG one byte short (its IDAT
+    // checksum has three bytes) passes the probe and fails the decode, so the import is
+    // refused with "The media object could not be loaded because it is not a valid image
+    // type". GDI+ on Windows decodes the same file and stores 99 bytes, the bytes Patch #40
+    // returns for it. The replacement makes the original's two calls, and only when Skia
+    // returns no bitmap decodes GdiPlusPng's re-encoding of the source instead. Every other
+    // image takes exactly the original path.
+
+    private static MethodInfo? _skDataCreateCopy;
+    private static MethodInfo? _skBitmapDecode;
+    private static MethodInfo? _remapImageException;
+
+    private static void PatchNavMediaImageSkiaDecode(Assembly navNcl)
+    {
+        if (IsPatchDisabled("42")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Media.NavMediaImageSkia");
+            if (type == null) return; // BC 27/28: NavMediaImage decodes through DrawingStub
+            var original = type.GetMethod("DecodeBitmapOrThrow", BindingFlags.Static | BindingFlags.NonPublic,
+                null, new[] { typeof(byte[]) }, null);
+            var skia = original?.ReturnType.Assembly;
+            var skData = skia?.GetType("SkiaSharp.SKData");
+            _skDataCreateCopy = skData?.GetMethod("CreateCopy", BindingFlags.Static | BindingFlags.Public,
+                null, new[] { typeof(byte[]) }, null);
+            _skBitmapDecode = original?.ReturnType.GetMethod("Decode", BindingFlags.Static | BindingFlags.Public,
+                null, skData == null ? Type.EmptyTypes : new[] { skData }, null);
+            _remapImageException = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Media.NavMediaImageExceptionMapper")
+                ?.GetMethod("RemapImageException", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                    null, new[] { typeof(Exception), typeof(string) }, null);
+            if (original == null || original.ReturnType.FullName != "SkiaSharp.SKBitmap"
+                || _skDataCreateCopy == null || _skBitmapDecode == null || _remapImageException == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #42: NavMediaImageSkia decode shape changed — skipping");
+                return;
+            }
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_NavMediaImageSkiaDecode),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "NavMediaImageSkia.DecodeBitmapOrThrow (Patch #42)");
+            Console.WriteLine("[StartupHook] Patch #42: NavMediaImageSkia decodes a PNG Skia refuses through GdiPlusPng");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #42 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static object Replacement_NavMediaImageSkiaDecode(byte[] bytes)
+    {
+        var bitmap = SkiaDecode(bytes);
+        if (bitmap != null)
+            return bitmap;
+        if (!_gdiPlusPngProbed)
+        {
+            _gdiPlusPngReencode = Type.GetType("System.Drawing.GdiPlusPng, System.Drawing.Common")
+                ?.GetMethod("TryReencode", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+            _gdiPlusPngProbed = true;
+        }
+        if (_gdiPlusPngReencode?.Invoke(null, new object[] { bytes }) is byte[] reencoded)
+        {
+            bitmap = SkiaDecode(reencoded);
+            if (bitmap != null)
+                return bitmap;
+        }
+        throw (Exception)_remapImageException!.Invoke(null, new object?[] { new ArgumentException("Unknown image format."), null })!;
+    }
+
+    private static object? SkiaDecode(byte[] bytes)
+    {
+        using var data = (IDisposable)_skDataCreateCopy!.Invoke(null, new object[] { bytes })!;
+        return _skBitmapDecode!.Invoke(null, new object[] { data });
+    }
+
+    // ========================================================================
+    // Patch #43: HttpClientRequestFilterService prompt (Nav.Ncl.dll) — issue #165
+    // ========================================================================
+    // On a Sandbox tenant HttpClientRequestFilterService.ApplyRequestFiltering looks the calling
+    // app up in the app setting table (2000000201, field 2 "allow HttpClient requests"). With no
+    // row it calls RequestUserPermissionForBlockingOrAllowingRequestFromApplication, which opens
+    // a StrMenu when the session allows callbacks. A test session has no user, so with
+    // Patch #38 in place the menu raises "Unhandled UI". The method returns (allow, save):
+    // (true, false) is "Allow Once", which neither asks nor writes a row.
+
+    private static void PatchHttpClientRequestPrompt(Assembly navNcl)
+    {
+        if (IsPatchDisabled("43")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.HttpClientRequestFilterService");
+            var original = type?.GetMethod("RequestUserPermissionForBlockingOrAllowingRequestFromApplication",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (original == null || original.ReturnType != typeof(ValueTuple<bool, bool>) || original.GetParameters().Length != 1)
+            {
+                Console.WriteLine("[StartupHook] Patch #43: HttpClientRequestFilterService shape changed — skipping");
+                return;
+            }
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_AllowHttpClientRequestOnce),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "HttpClientRequestFilterService.RequestUserPermission... (Patch #43)");
+            Console.WriteLine("[StartupHook] Patch #43: the HttpClient approval prompt answers Allow Once");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #43 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static ValueTuple<bool, bool> Replacement_AllowHttpClientRequestOnce(object owningApp)
+        => new ValueTuple<bool, bool>(true, false);
+
+    // ========================================================================
+    // Patch #41: WildcardEvaluatorHelper (Nav.Ncl.dll, BC 27) — issue #153
+    // ========================================================================
+    // BC 27's WildcardEvaluator matches the constant parts of a pattern that contains '?'
+    // (and the "x?" / "?x" shapes) through WildcardEvaluatorHelper, which P/Invokes
+    // kernel32 FindNLSString and FindStringOrdinal. Patch #3 sends those to
+    // libwin32_stubs.so, whose versions return -1 ("not found") for every input. So on
+    // BC 27 no in-memory filter with a '?' ever matched. The visible case is the Cronus
+    // license's date filter "??11*|??12*|??01*|??02*", checked against "ddMMyy" when a date
+    // is typed into a page: every date was refused. BC 28 replaced the helper with the
+    // CompareInfo span overloads, and the replacements below make the same calls.
+    //
+    // The argument checks and the ordinal branch are the original's. The original also
+    // always adds NORM_LINGUISTIC_CASING, which ICU applies anyway.
+
+    private static void PatchWildcardEvaluatorHelper(Assembly navNcl)
+    {
+        if (IsPatchDisabled("41")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.WildcardEvaluatorHelper");
+            if (type == null) return; // BC 28 and later: WildcardEvaluator uses CompareInfo itself
+            const BindingFlags stat = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+            var outInt = typeof(int).MakeByRefType();
+            var prefixSuffix = type.GetMethod("IsPrefixSuffixInternal", stat, null,
+                new[] { typeof(uint), typeof(int), typeof(string), typeof(int), typeof(int), typeof(string), typeof(CompareOptions), outInt }, null);
+            var indexOf = type.GetMethod("IndexOf", stat, null,
+                new[] { typeof(int), typeof(string), typeof(string), typeof(int), typeof(int), typeof(CompareOptions), outInt }, null);
+            if (prefixSuffix == null || indexOf == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #41: WildcardEvaluatorHelper shape changed — skipping");
+                return;
+            }
+            ApplyJmpHook(prefixSuffix, typeof(StartupHook).GetMethod(nameof(Replacement_WildcardIsPrefixSuffix), stat)!,
+                "WildcardEvaluatorHelper.IsPrefixSuffixInternal (Patch #41)");
+            ApplyJmpHook(indexOf, typeof(StartupHook).GetMethod(nameof(Replacement_WildcardIndexOf), stat)!,
+                "WildcardEvaluatorHelper.IndexOf (Patch #41)");
+            Console.WriteLine("[StartupHook] Patch #41: '?' filter matching uses CompareInfo instead of FindNLSString");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #41 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private const uint FindStartsWith = 0x00100000;
+    private const CompareOptions ValidNlsCompareOptions = (CompareOptions)31;
+
+    private static bool Replacement_WildcardIsPrefixSuffix(uint operation, int locale, string source, int startIndex,
+        int sourceLength, string value, CompareOptions options, out int matchLength)
+    {
+        if (source == null || value == null)
+            throw new ArgumentNullException(source == null ? "source" : "value");
+        matchLength = value.Length;
+        if (value.Length == 0) return true;
+        if (source.Length == 0) return false;
+        if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
+        if (sourceLength < 0 || startIndex > source.Length - sourceLength)
+            throw new ArgumentOutOfRangeException("sourceLength");
+        var span = source.AsSpan(startIndex, sourceLength);
+        bool prefix = operation == FindStartsWith;
+        if (options == CompareOptions.Ordinal || options == CompareOptions.OrdinalIgnoreCase)
+        {
+            var comparison = options == CompareOptions.Ordinal ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            return prefix ? span.StartsWith(value, comparison) : span.EndsWith(value, comparison);
+        }
+        if ((options & ~ValidNlsCompareOptions) != 0)
+            throw new ArgumentException("Unsupported combination of flags", "options");
+        var compareInfo = CompareInfo.GetCompareInfo(locale);
+        return prefix
+            ? compareInfo.IsPrefix(span, value, options, out matchLength)
+            : compareInfo.IsSuffix(span, value, options, out matchLength);
+    }
+
+    private static int Replacement_WildcardIndexOf(int locale, string source, string value, int startIndex, int count,
+        CompareOptions options, out int matchLength)
+    {
+        if (source == null || value == null)
+            throw new ArgumentNullException(source == null ? "source" : "value");
+        if (startIndex > source.Length) throw new ArgumentOutOfRangeException("startIndex");
+        matchLength = value.Length;
+        if (source.Length == 0) return value.Length == 0 ? 0 : -1;
+        if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
+        if (count < 0 || startIndex > source.Length - count) throw new ArgumentOutOfRangeException("count");
+        if (options == CompareOptions.Ordinal || options == CompareOptions.OrdinalIgnoreCase)
+            return source.IndexOf(value, startIndex, count,
+                options == CompareOptions.Ordinal ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase);
+        if ((options & ~ValidNlsCompareOptions) != 0)
+            throw new ArgumentException("Unsupported combination of flags", "options");
+        int found = CompareInfo.GetCompareInfo(locale).IndexOf(source.AsSpan(startIndex, count), value, options, out matchLength);
+        return found >= 0 ? found + startIndex : found;
+    }
+
+    // ========================================================================
+    // Patch #35: NavFile.ALIsPathTemporary — keep the user-folder check (issue #122)
+    // ========================================================================
+
+    private static ConstructorInfo? _invalidPathExceptionCtor;   // (string, params DiagnosticParameter[])
+    private static MethodInfo? _diagnosticParameterEuii;
+    private static PropertyInfo? _langFileAccessLimitedToUserFolder;
+
+    private static void PatchNavFileIsPathTemporary(Assembly navNcl)
+    {
+        if (IsPatchDisabled("35")) return;
+        try
+        {
+            var navFileType = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavFile");
+            MethodInfo? isTemp = null;
+            foreach (var m in navFileType?.GetMethods(BindingFlags.Static | BindingFlags.Public) ?? Array.Empty<MethodInfo>())
+            {
+                var p = m.GetParameters();
+                if (m.Name == "ALIsPathTemporary" && p.Length == 2
+                    && p[0].ParameterType.IsEnum && p[1].ParameterType == typeof(string))
+                {
+                    isTemp = m;
+                    break;
+                }
+            }
+            if (isTemp == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #35: NavFile.ALIsPathTemporary(DataError,string) not found — skipping");
+                return;
+            }
+
+            _sessionUserFolderProp ??= navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavSession")
+                ?.GetProperty("UserFolder", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            _navCurrentThreadSessionProp ??= navNcl
+                .GetType("Microsoft.Dynamics.Nav.Runtime.NavCurrentThread")
+                ?.GetProperty("Session", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            // The exception BC throws when a path leaves the user folder, resolved now so the
+            // replacement does no type lookups. Missing pieces only cost the error text: the
+            // trapped case (the one AL code checks) returns false without them.
+            var diagParamType = Type.GetType("Microsoft.Dynamics.Nav.Diagnostic.DiagnosticParameter, Microsoft.Dynamics.Nav.Types");
+            _diagnosticParameterEuii = diagParamType?.GetMethod("Euii", BindingFlags.Static | BindingFlags.Public,
+                null, new[] { typeof(object) }, null);
+            if (diagParamType != null)
+                _invalidPathExceptionCtor = Type.GetType("Microsoft.Dynamics.Nav.Types.Exceptions.NavNCLInvalidPathException, Microsoft.Dynamics.Nav.Types")
+                    ?.GetConstructor(new[] { typeof(string), diagParamType.MakeArrayType() });
+            _langFileAccessLimitedToUserFolder = Type.GetType("Microsoft.Dynamics.Nav.Common.Language.Lang, Microsoft.Dynamics.Nav.Language")
+                ?.GetProperty("FileAccessLimitedToUserFolder", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_NavFileIsPathTemporary),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(isTemp, replacement, "NavFile.ALIsPathTemporary (Patch #35)");
+            Console.WriteLine("[StartupHook] Patch #35: NavFile.ALIsPathTemporary user-folder check active");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #35 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replacement for static NavFile.ALIsPathTemporary(DataError errorLevel, string filePath).
+    /// The original is "ExpandFileName(ThrowError, filePath, enforceUserPath: true) did not
+    /// throw". Patch #28 stopped ExpandFileName from enforcing the user folder, so every path
+    /// came back temporary. This answers the question the original asked, with Linux path
+    /// rules plus the Windows forms AL code still uses: a drive letter ("C:\", "Z:/") or a UNC
+    /// path ("\\server\share") is rooted outside the user folder, as it is on Windows.
+    /// DataError is an int-backed enum (TrapError = 0, ThrowError = 1).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool Replacement_NavFileIsPathTemporary(int errorLevel, string filePath)
+    {
+        // ExpandFileName returns an empty name unchanged, so the original says true.
+        if (string.IsNullOrEmpty(filePath)) return true;
+
+        string fullPath = filePath;
+        bool inside;
+        try
+        {
+            var session = _navCurrentThreadSessionProp?.GetValue(null);
+            var userFolder = session != null ? _sessionUserFolderProp?.GetValue(session) as string : null;
+            if (string.IsNullOrEmpty(userFolder)) return true;
+            userFolder = System.IO.Path.GetFullPath(userFolder.Replace('\\', '/'));
+
+            bool windowsRooted = filePath.Length >= 2
+                && ((char.IsAsciiLetter(filePath[0]) && filePath[1] == ':')
+                    || ((filePath[0] == '\\' || filePath[0] == '/') && (filePath[1] == '\\' || filePath[1] == '/')));
+            if (windowsRooted)
+            {
+                inside = false;
+            }
+            else
+            {
+                fullPath = filePath.Replace('\\', '/');
+                if (!System.IO.Path.IsPathRooted(fullPath))
+                    fullPath = System.IO.Path.Combine(userFolder, fullPath);
+                fullPath = System.IO.Path.GetFullPath(fullPath);
+                inside = fullPath.StartsWith(userFolder, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch
+        {
+            // An invalid path is not this patch's question; keep the pre-patch answer.
+            return true;
+        }
+
+        if (inside) return true;
+        if (errorLevel == 0) return false;
+
+        Exception? ex = null;
+        try
+        {
+            var message = _langFileAccessLimitedToUserFolder?.GetValue(null) as string;
+            if (message != null && _invalidPathExceptionCtor != null && _diagnosticParameterEuii != null)
+            {
+                var args = Array.CreateInstance(_diagnosticParameterEuii.ReturnType, 1);
+                args.SetValue(_diagnosticParameterEuii.Invoke(null, new object[] { fullPath }), 0);
+                ex = _invalidPathExceptionCtor.Invoke(new object[] { message, args }) as Exception;
+            }
+        }
+        catch { }
+        throw ex ?? new UnauthorizedAccessException(
+            $"Files outside of the current user's folder cannot be accessed. Access is denied to file '{fullPath}'.");
+    }
+
     // ========================================================================
     // JMP Hook Infrastructure
     // ========================================================================
@@ -3278,7 +4846,7 @@ internal class StartupHook
     /// Force JIT compilation of both methods, then overwrite the original's native code
     /// entry with an absolute JMP to the replacement. Works on JIT-compiled BC methods only.
     /// </summary>
-    private static void ApplyJmpHook(MethodBase original, MethodInfo replacement, string name)
+    internal static void ApplyJmpHook(MethodBase original, MethodInfo replacement, string name)
     {
         // Never apply a JMP hook to a method that already carries one.
         //
@@ -3298,6 +4866,21 @@ internal class StartupHook
         // genuine StubPrecode also starts FF 25 but always has a non-zero disp32, so
         // the signature is unambiguous.
         if (IsAlreadyJmpHooked(original, name)) return;
+
+        // A JMP hook makes the caller's call site land on the replacement while still using
+        // the ORIGINAL method's calling convention, so the two signatures have to agree at
+        // the ABI level. Nothing checked that until now, and one hook had been wrong since
+        // it was written: Patch #21's replacement was declared `void` against a method that
+        // returns `bool`, so `if (!ShowForm(...))` in Microsoft's InvokeCore branched on
+        // whatever happened to be in the return register.
+        //
+        // This check reports, it does not refuse. Two hooks deliberately declare fewer
+        // parameters than the method they replace (IsTypeForwardingCircularNoop and
+        // CheckFileNameNoop take none) — harmless on x64, where unread argument registers
+        // are simply ignored — and refusing those would stop BC booting. A return-type
+        // class mismatch is the one that silently corrupts a caller, so it is logged as an
+        // error and is worth treating as a bug in the patch.
+        ValidateJmpHookAbi(original, replacement, name);
 
         RuntimeHelpers.PrepareMethod(original.MethodHandle);
         RuntimeHelpers.PrepareMethod(replacement.MethodHandle);
@@ -3383,6 +4966,80 @@ internal class StartupHook
     /// point WITHOUT calling PrepareMethod first — PrepareMethod is itself what dies on
     /// an already-patched method under .NET 10.
     /// </summary>
+
+    /// <summary>How a type is passed/returned on x64, coarse enough to catch a real mismatch.</summary>
+    private enum JmpAbiClass { Void, Integer, Float, Struct }
+
+    private static JmpAbiClass ClassifyForJmpAbi(Type t)
+    {
+        if (t == typeof(void)) return JmpAbiClass.Void;
+        if (!t.IsValueType) return JmpAbiClass.Integer;          // reference or pointer — one register
+        if (t.IsEnum) return JmpAbiClass.Integer;
+        if (t == typeof(float) || t == typeof(double)) return JmpAbiClass.Float;
+        if (t.IsPrimitive || t == typeof(IntPtr) || t == typeof(UIntPtr)) return JmpAbiClass.Integer;
+        return JmpAbiClass.Struct;                                // needs an exact type match
+    }
+
+    /// <summary>
+    /// Compare the hooked method's signature with the replacement's and log any way the two
+    /// disagree at the ABI level. Never throws and never refuses the hook — see the call site.
+    /// </summary>
+    private static void ValidateJmpHookAbi(MethodBase original, MethodInfo replacement, string name)
+    {
+        try
+        {
+            Type originalReturn = original is MethodInfo mi ? mi.ReturnType : typeof(void);
+            var originalReturnClass = ClassifyForJmpAbi(originalReturn);
+            var replacementReturnClass = ClassifyForJmpAbi(replacement.ReturnType);
+
+            bool returnMismatch = originalReturnClass != replacementReturnClass
+                || (originalReturnClass == JmpAbiClass.Struct && originalReturn != replacement.ReturnType);
+            if (returnMismatch)
+            {
+                Console.WriteLine($"[StartupHook] ERROR: JMP hook ABI mismatch on {name}: "
+                    + $"replaced method returns {originalReturn.Name} but the replacement returns "
+                    + $"{replacement.ReturnType.Name}. The caller will read an undefined return value.");
+            }
+
+            var originalParams = original.GetParameters();
+            var replacementParams = replacement.GetParameters();
+            int expected = originalParams.Length + (original.IsStatic ? 0 : 1);
+            if (replacementParams.Length != expected)
+            {
+                Console.WriteLine($"[StartupHook] WARNING: JMP hook arity on {name}: replacement takes "
+                    + $"{replacementParams.Length} parameter(s), the replaced "
+                    + $"{(original.IsStatic ? "static" : "instance")} method needs {expected} "
+                    + $"(this is deliberate for the two argument-ignoring no-ops).");
+                return;
+            }
+
+            // Line the two up: for an instance method the replacement's first parameter is 'this'.
+            int offset = original.IsStatic ? 0 : 1;
+            if (offset == 1 && ClassifyForJmpAbi(replacementParams[0].ParameterType) != JmpAbiClass.Integer)
+            {
+                Console.WriteLine($"[StartupHook] WARNING: JMP hook ABI on {name}: the replacement's first "
+                    + $"parameter is {replacementParams[0].ParameterType.Name}, but it receives 'this'.");
+            }
+            for (int i = 0; i < originalParams.Length; i++)
+            {
+                Type a = originalParams[i].ParameterType;
+                Type b = replacementParams[i + offset].ParameterType;
+                var ca = ClassifyForJmpAbi(a);
+                var cb = ClassifyForJmpAbi(b);
+                if (ca != cb || (ca == JmpAbiClass.Struct && a != b))
+                {
+                    Console.WriteLine($"[StartupHook] WARNING: JMP hook ABI on {name}: parameter {i} is "
+                        + $"{a.Name} on the replaced method but {b.Name} on the replacement.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Diagnostics only — a failure here must never stop a patch being applied.
+            Console.WriteLine($"[StartupHook] JMP hook ABI check failed for {name}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     private static bool IsAlreadyJmpHooked(MethodBase original, string name)
     {
         try
@@ -3558,6 +5215,547 @@ internal class StartupHook
     [MethodImpl(MethodImplOptions.NoInlining)]
     public static object? Replacement_ReturnNull_1Arg(object? self) { return null; }
 
+    /// <summary>
+    /// No-op replacement for an instance `void Dispose(bool)`. The receiver arrives as the
+    /// first explicit argument; the bool is ignored.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Replacement_NoOp_ObjectBool(object self, bool disposing) { }
+
+    // ========================================================================
+    // Patch #32: NavLicense.Dispose(bool) — stop license teardown from killing
+    // an in-flight session's permission check
+    // ------------------------------------------------------------------------
+    // The chain, all inside Nav.Ncl:
+    //
+    //   NavDatabase.Dispose(bool)
+    //     -> NavDatabaseSecurityAndLicense.Dispose(bool)
+    //          licenseLock.Dispose();
+    //          license.Dispose(); license = null;
+    //     -> NavLicense.Dispose(bool)
+    //          dataReader?.Dispose(); dataReader = null;
+    //     -> BclLicenseDataReader.IDisposable.Dispose()
+    //          reader = null;                      // that is the ENTIRE body
+    //
+    // and on the reader side, every accessor dereferences `reader` unguarded:
+    //
+    //   bool TryGetPermissionMask(ObjectType t, int n, out PermissionMask m) {
+    //       m = PermissionMask.None;
+    //       var p = reader.GetObjectRangePermission(...);   // NRE once disposed
+    //
+    // The two sides are not serialized against each other. NavDatabaseSecurityAndLicense
+    // .GetLicensePermissions takes licenseLock only around its memo-cache reads and
+    // writes; the actual license lookup —
+    //   getLicenseFunc = id => NavCurrentThread.Session.License.GetLicensePermissionMask(...)
+    // — runs between the read lock and the upgradeable read lock, holding nothing. So a
+    // NavDatabase teardown concurrent with a running session hands that session a
+    // NullReferenceException from inside Microsoft's license reader, on whatever AL
+    // statement happened to trigger a permission check.
+    //
+    // Fix: no-op Dispose(bool). Justification for why that is free rather than a leak:
+    //
+    //   * The body releases nothing. There is no unmanaged resource, no OS handle, no
+    //     finalizer to suppress beyond the GC.SuppressFinalize the public Dispose() already
+    //     does. Setting fields to null is a GC hint, not a release.
+    //   * `isDisposed` is read in exactly one place — Dispose(bool) itself (verified with a
+    //     field-usage scan across the assembly). Nothing else changes behaviour once the
+    //     license is "disposed", so skipping the flag is not observable.
+    //   * The owner drops the reference anyway: NavDatabaseSecurityAndLicense.Dispose sets
+    //     its own `license` field to null immediately after. The NavLicense, its dataReader
+    //     and the parsed license content therefore become unreachable at the same moment
+    //     they would have before — the graph is collected, just one hop later.
+    //
+    // Net effect: a session that races the teardown reads a still-valid license and gets
+    // the correct permission mask, instead of dying.
+    //
+    // Not a Linux-specific defect — no Win32 surface anywhere in the chain — but bc-linux
+    // is unusually good at provoking it. run-tests-altool.py's default `cli` transport
+    // starts a fresh BC session per codeunit, and run-tests-hybrid.py runs a websocket leg
+    // concurrently, so session start and database teardown overlap continuously for the
+    // length of a run. Observed as a one-off red leg on BC 28.0 in a 315-codeunit run while
+    // seven sibling legs on the same commit passed.
+    //
+    // Applied on every BC version. Method body verified byte-identical on 27.0, 28.0, 28.4.
+    // ========================================================================
+    private static void PatchNavLicenseDispose(Assembly navNcl)
+    {
+        if (IsPatchDisabled("32")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavLicense");
+            if (type == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32: NavLicense type not found — skipping");
+                return;
+            }
+
+            var dispose = type.GetMethod("Dispose",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                binder: null, types: new[] { typeof(bool) }, modifiers: null);
+            if (dispose == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32: NavLicense.Dispose(bool) not found — skipping");
+                return;
+            }
+
+            // Shape check: only hook while the body is still the "null the fields" form we
+            // reasoned about. If Microsoft ever gives NavLicense a real resource to release,
+            // the field set changes and we back off rather than leak it.
+            var dataReaderField = type.GetField("dataReader",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (dataReaderField == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32: NavLicense.dataReader field shape changed — skipping");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_NoOp_ObjectBool),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(dispose, replacement, "NavLicense.Dispose (Patch #32)");
+            Console.WriteLine("[StartupHook] Patch #32: NavLicense.Dispose(bool) no-op'd (license teardown vs. in-flight session)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #32 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // ========================================================================
+    // Patch #34: DevTestRunnerCodeunit.OnBeforeTestRunAsync — clear the last error per method
+    // ------------------------------------------------------------------------
+    //   public override ValueTask<bool> OnBeforeTestRunAsync(int codeUnitId, NavText codeUnitName,
+    //       NavText functionName, NavTestPermissions testPermissions) {
+    //       if (!string.IsNullOrEmpty(functionName) && !"OnRun".Equals(functionName.Value, ...)
+    //           && TestsToRun != null && TestsToRun.Count != 0 && !TestsToRun.Contains(functionName.Value))
+    //           return ValueTask.FromResult(false);
+    //       OnBeforeTestRunEvent?.Invoke(this, new TestInfo { CodeunitId = ..., MethodName = ... });
+    //       return ValueTask.FromResult(true);
+    //   }
+    //
+    // The same body plus Session.ClearLastError() first. See the header comment for why.
+    // The signature is mirrored with `int` for the NavTestPermissions enum (same register) and
+    // `object` for the NavText references; the return type is the real ValueTask<bool>, so the
+    // hidden return-buffer convention matches the original exactly.
+    // ========================================================================
+    private static FieldInfo? _devRunnerBeforeEventField;
+    private static PropertyInfo? _devRunnerTestsToRunProp;
+    private static PropertyInfo? _devRunnerSessionProp;
+    private static MethodInfo? _sessionClearLastError;
+    private static Type? _devRunnerTestInfoType;
+
+    private static void PatchDevTestRunnerOnBeforeTestRun(Assembly navNcl)
+    {
+        if (IsPatchDisabled("34")) return;
+        try
+        {
+            // A direct lookup, not GetTypes(): this runs inside Nav.Ncl's AssemblyLoad event, and
+            // enumerating every type there forces a large amount of type loading while the NST is
+            // still initializing (and throws, since Ncl references assemblies this image does not
+            // carry). The class is a plain type in this namespace, so the name is exact.
+            Type? runner = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.Testability.DevTestRunnerCodeunit");
+            if (runner == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #34: DevTestRunnerCodeunit not found — skipping (no TestRunnerHub in this build)");
+                return;
+            }
+
+            const BindingFlags all = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var original = runner.GetMethods(all | BindingFlags.DeclaredOnly)
+                .FirstOrDefault(m => m.Name == "OnBeforeTestRunAsync" && m.GetParameters().Length == 4);
+            _devRunnerBeforeEventField = runner.GetField("OnBeforeTestRunEvent", all);
+            _devRunnerTestsToRunProp = runner.GetProperty("TestsToRun", all);
+            _devRunnerSessionProp = runner.GetProperty("Session", all | BindingFlags.FlattenHierarchy);
+            _devRunnerTestInfoType = _devRunnerBeforeEventField?.FieldType.GetGenericArguments().FirstOrDefault();
+            _sessionClearLastError = _devRunnerSessionProp?.PropertyType.GetMethod("ClearLastError", all, binder: null, types: Type.EmptyTypes, modifiers: null);
+
+            if (original == null || original.ReturnType != typeof(ValueTask<bool>)
+                || _devRunnerBeforeEventField == null || _devRunnerTestsToRunProp == null
+                || _devRunnerSessionProp == null || _sessionClearLastError == null || _devRunnerTestInfoType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #34: DevTestRunnerCodeunit shape changed — skipping");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_DevOnBeforeTestRunAsync),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(original, replacement, "DevTestRunnerCodeunit.OnBeforeTestRunAsync (Patch #34)");
+            Console.WriteLine("[StartupHook] Patch #34: DevTestRunnerCodeunit.OnBeforeTestRunAsync hooked (last error cleared per test method)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #34 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // ========================================================================
+    // Patch #38: the hub reports unhandled UI as a Windows test session does (issue #139)
+    // ------------------------------------------------------------------------
+    // TestRunnerRuntime.InitializeRuntime (Nav.Service.Dev) sets
+    // TestRunSession.TestExecution.SuppressUnhandledUI = true. NavTestExecution.FindHandler
+    // then never throws NavNCLMissingUIHandlerException, so on the hub an unhandled Confirm
+    // returns its default, a Message or StrMenu passes, and a page open shows nothing. A
+    // Windows test session (an AL test runner codeunit, SuppressUnhandledUI false) fails with
+    // "Unhandled UI: <kind> <text>", code MissingUIHandler. The hub is the only code that sets
+    // the property, so it is reset to false before every test method, here in Patch #34's
+    // replacement, which is the hub's own per-method hook. The property's setter is called
+    // through reflection: hooking the auto-property itself would not hold, because the JIT
+    // inlines a trivial setter or getter into its callers from IL. BC_DISABLE_PATCHES=38
+    // restores the hub's own behavior.
+    // ========================================================================
+    private static PropertyInfo? _sessionTestExecutionProp;
+    private static PropertyInfo? _suppressUnhandledUiProp;
+    private static bool _suppressUnhandledUiReported;
+    private static bool? _patch38Disabled;
+
+    private static void AllowUnhandledUiErrors(object devRunner)
+    {
+        _patch38Disabled ??= IsPatchDisabled("38");
+        if (_patch38Disabled == true) return;
+        try
+        {
+            var session = _devRunnerSessionProp!.GetValue(devRunner);
+            if (session == null) return;
+            const BindingFlags all = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            _sessionTestExecutionProp ??= session.GetType().GetProperty("TestExecution", all);
+            var execution = _sessionTestExecutionProp?.GetValue(session);
+            if (execution == null) return;
+            _suppressUnhandledUiProp ??= execution.GetType().GetProperty("SuppressUnhandledUI", all);
+            if (_suppressUnhandledUiProp == null)
+            {
+                if (!_suppressUnhandledUiReported)
+                    Console.WriteLine("[StartupHook] Patch #38: NavTestExecution.SuppressUnhandledUI not found — skipping");
+                _suppressUnhandledUiReported = true;
+                return;
+            }
+            if (_suppressUnhandledUiProp.GetValue(execution) is true)
+            {
+                _suppressUnhandledUiProp.SetValue(execution, false);
+                if (!_suppressUnhandledUiReported)
+                    Console.WriteLine("[StartupHook] Patch #38: hub test session reports unhandled UI as a Windows test session does");
+                _suppressUnhandledUiReported = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #38 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static ValueTask<bool> Replacement_DevOnBeforeTestRunAsync(object self, int codeUnitId, object codeUnitName, object functionName, int testPermissions)
+    {
+        // What a real tier's OnBeforeTestMethodRun does first. Never let it block the run.
+        try
+        {
+            var session = _devRunnerSessionProp!.GetValue(self);
+            if (session != null) _sessionClearLastError!.Invoke(session, null);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #34: ClearLastError failed: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        AllowUnhandledUiErrors(self);
+
+        string fn = ShowFormGetProperty(functionName, "Value") as string ?? string.Empty;
+        var toRun = _devRunnerTestsToRunProp!.GetValue(self) as HashSet<string>;
+        if (!string.IsNullOrEmpty(fn) && !"OnRun".Equals(fn, StringComparison.OrdinalIgnoreCase)
+            && toRun != null && toRun.Count != 0 && !toRun.Contains(fn))
+        {
+            return new ValueTask<bool>(false);
+        }
+
+        if (_devRunnerBeforeEventField!.GetValue(self) is Delegate handler)
+        {
+            object info = Activator.CreateInstance(_devRunnerTestInfoType!)!;
+            _devRunnerTestInfoType!.GetField("CodeunitId")!.SetValue(info, codeUnitId);
+            _devRunnerTestInfoType.GetField("MethodName")!.SetValue(info, fn);
+            handler.DynamicInvoke(self, info);
+        }
+        return new ValueTask<bool>(true);
+    }
+
+    // ========================================================================
+    // Patch #36: TestRunnerClientCallback file callbacks (Microsoft.Dynamics.Nav.Service.Dev)
+    // ------------------------------------------------------------------------
+    // The hub's client callback answers every file dialog with "nothing happened": a
+    // download returns false, an import returns false. A Windows container's test run goes
+    // through the web server's client-services session instead, which hands a download to
+    // the caller as a link (true, file name unchanged) and refuses an upload with
+    // NavNotSupportedFileDialogProviderException. The websocket runner's client gives the
+    // same answers (tools/TestRunner, FileActionDialog). Only the hub's runner class is
+    // touched; a real client session still goes through NSClientCallback. Issue #122.
+    // ========================================================================
+    private static Type? _notSupportedFileDialogExceptionType;
+
+    private static void PatchTestRunnerClientCallback(Assembly serviceDev)
+    {
+        if (IsPatchDisabled("36")) return;
+        try
+        {
+            var callback = serviceDev.GetType("Microsoft.Dynamics.Nav.Service.Dev.TestExecution.TestRunnerClientCallback");
+            if (callback == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #36: TestRunnerClientCallback not found — skipping (no TestRunnerHub in this build)");
+                return;
+            }
+            _notSupportedFileDialogExceptionType = Type.GetType(
+                "Microsoft.Dynamics.Nav.Types.Exceptions.NavNotSupportedFileDialogProviderException, Microsoft.Dynamics.Nav.Types");
+
+            const BindingFlags all = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            var download = callback.GetMethods(all).FirstOrDefault(m => m.Name == "DownloadFileAction"
+                && m.ReturnType == typeof(bool) && m.GetParameters().Length == 7);
+            var import = callback.GetMethods(all).FirstOrDefault(m => m.Name == "ImportDataAction"
+                && m.ReturnType == typeof(bool) && m.GetParameters().Length == 3);
+            // Issue #138 and #141: the export half of Database.ExportData, and every upload
+            // (Xmlport.Run of an import xmlport with no source, UploadIntoStream, File.Upload).
+            var export = callback.GetMethods(all).FirstOrDefault(m => m.Name == "ExportDataAction"
+                && m.ReturnType == typeof(bool) && m.GetParameters().Length == 4);
+            var upload = callback.GetMethods(all).FirstOrDefault(m => m.Name == "UploadFileAction"
+                && m.GetParameters().Length == 6);
+            if (download == null || import == null || export == null || upload == null
+                || _notSupportedFileDialogExceptionType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #36: TestRunnerClientCallback shape changed — skipping");
+                return;
+            }
+
+            ApplyJmpHook(download, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerDownloadFileAction),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.DownloadFileAction (Patch #36)");
+            ApplyJmpHook(import, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerImportDataAction),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.ImportDataAction (Patch #36)");
+            ApplyJmpHook(export, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerExportDataAction),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.ExportDataAction (Patch #36)");
+            ApplyJmpHook(upload, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerUploadFileAction),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.UploadFileAction (Patch #36)");
+            Console.WriteLine("[StartupHook] Patch #36: TestRunnerClientCallback download/export/import/upload answer as a Windows test client");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #36 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool Replacement_TestRunnerDownloadFileAction(object self, System.IO.Stream stream, bool displayDialog,
+        string title, string initialFolder, string typeFilter, ref string fileName, Guid automationId)
+    {
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool Replacement_TestRunnerImportDataAction(object self, ref string fileName, string dialogTitle, bool showDialog)
+    {
+        throw NotSupportedFileDialog();
+    }
+
+    // Database.ExportData (issue #138). ALDatabase.ALExportData writes the export on a pool
+    // thread into a ReaderBlocksWriterStream and hands the reader to this callback; false
+    // makes ExportData return false. A Windows test run's client takes the export as a
+    // download: true, file name unchanged. The stream has to be read to the end, or the
+    // writer blocks until the pipe times out (the websocket runner hit that in issue #125).
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool Replacement_TestRunnerExportDataAction(object self, System.IO.Stream stream, ref string fileName,
+        string dialogTitle, bool showDialog)
+    {
+        stream?.CopyTo(System.IO.Stream.Null);
+        return true;
+    }
+
+    // Every upload: Xmlport.Run of an import xmlport with no source, UploadIntoStream,
+    // File.Upload (issue #141). The hub returned null, which an import xmlport read as an
+    // empty file and ran without an error. A Windows test run's client refuses every upload
+    // with NavNotSupportedFileDialogProviderException; the websocket runner does the same
+    // since issue #122.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object Replacement_TestRunnerUploadFileAction(object self, bool displayDialog, string title,
+        string initialFolder, string typeFilter, ref string fileName, Guid automationId)
+    {
+        throw NotSupportedFileDialog();
+    }
+
+    // On Windows the client's exception crosses the wire, and the server rethrows a clone
+    // that wraps it (ExceptionHandler.WrapOriginalException). That nesting is what makes
+    // the AL error code "NotSupportedFileDialogProvider:NotSupportedFileDialogProvider".
+    private static Exception NotSupportedFileDialog()
+    {
+        var inner = (Exception)Activator.CreateInstance(_notSupportedFileDialogExceptionType!)!;
+        return (Exception)Activator.CreateInstance(_notSupportedFileDialogExceptionType!, inner.Message, inner)!;
+    }
+
+    // ========================================================================
+    // Patch #37: TestRunnerClientCallback RunOnClient DotNet (Microsoft.Dynamics.Nav.Service.Dev)
+    // ------------------------------------------------------------------------
+    // CreateDotNetHandle and InvokeAutomationMethod both return null on the hub, so the
+    // first RunOnClient DotNet a page touches dereferences a null handle. The answers below
+    // are the ones a Windows test run gets from the web server's ObservingAutomationHandler
+    // (Microsoft.Dynamics.Nav.Client.WebCommon): a handle for a known client extension type
+    // when no instance is asked for, false for its static IsAvailable and for #IsNull, and
+    // NavDotNetFromAlNotSupportedException for everything else. Issue #125.
+    // ========================================================================
+    private static readonly string[] ClientExtensionTypes =
+    {
+        // ObservingAutomationHandler.AllClientExtentionsTypes, BC 28.5.
+        "Microsoft.Dynamics.Nav.Client.Capabilities.LocationProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraBarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.BarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.DeviceContactProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Tour",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.UserTours",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.AppSource",
+        "Microsoft.Dynamics.Nav.Client.PageNotifier",
+        "Microsoft.Dynamics.Nav.Client.Hosts.OfficeHost",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Designer",
+    };
+
+    private static Type? _navAutomationHandleType;
+    private static Type? _dotNetFromAlNotSupportedExceptionType;
+    private static PropertyInfo? _automationRequestMethodName;
+    private static int _nextClientExtensionHandle = 1000;
+
+    private static void PatchTestRunnerClientCallbackDotNet(Assembly serviceDev)
+    {
+        if (IsPatchDisabled("37")) return;
+        try
+        {
+            var callback = serviceDev.GetType("Microsoft.Dynamics.Nav.Service.Dev.TestExecution.TestRunnerClientCallback");
+            if (callback == null) return; // Patch #36 already said why
+            _navAutomationHandleType = Type.GetType("Microsoft.Dynamics.Nav.Types.NavAutomationHandle, Microsoft.Dynamics.Nav.Types");
+            _dotNetFromAlNotSupportedExceptionType = Type.GetType(
+                "Microsoft.Dynamics.Nav.Types.Exceptions.NavDotNetFromAlNotSupportedException, Microsoft.Dynamics.Nav.Types");
+
+            const BindingFlags all = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
+            var create = callback.GetMethods(all).FirstOrDefault(m => m.Name == "CreateDotNetHandle"
+                && m.ReturnType == _navAutomationHandleType && m.GetParameters().Length == 6);
+            var invoke = callback.GetMethods(all).FirstOrDefault(m => m.Name == "InvokeAutomationMethod"
+                && m.ReturnType == typeof(object) && m.GetParameters().Length == 1);
+            _automationRequestMethodName = invoke?.GetParameters()[0].ParameterType.GetProperty("MethodName");
+            if (create == null || invoke == null || _navAutomationHandleType == null
+                || _dotNetFromAlNotSupportedExceptionType == null || _automationRequestMethodName == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #37: TestRunnerClientCallback shape changed — skipping");
+                return;
+            }
+
+            ApplyJmpHook(create, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerCreateDotNetHandle),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.CreateDotNetHandle (Patch #37)");
+            ApplyJmpHook(invoke, typeof(StartupHook).GetMethod(nameof(Replacement_TestRunnerInvokeAutomationMethod),
+                BindingFlags.Static | BindingFlags.NonPublic)!, "TestRunnerClientCallback.InvokeAutomationMethod (Patch #37)");
+            Console.WriteLine("[StartupHook] Patch #37: TestRunnerClientCallback RunOnClient DotNet answers as a Windows test client");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #37 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object Replacement_TestRunnerCreateDotNetHandle(object self, string assemblyFullName, string typeName,
+        Guid formHandle, string varName, bool createInstance, object[] arguments)
+    {
+        if (Array.IndexOf(ClientExtensionTypes, typeName) >= 0 && !createInstance && string.IsNullOrEmpty(varName))
+            return Activator.CreateInstance(_navAutomationHandleType!, System.Threading.Interlocked.Increment(ref _nextClientExtensionHandle), false)!;
+        throw ClientSideDotNetNotSupported();
+    }
+
+    // Wrapped the way the server rethrows a client's exception (as in Patch #36), so the AL
+    // error code is "DotNetFromAlNotSupported:DotNetFromAlNotSupported" on both runners.
+    private static Exception ClientSideDotNetNotSupported()
+    {
+        var inner = (Exception)Activator.CreateInstance(_dotNetFromAlNotSupportedExceptionType!)!;
+        return (Exception)Activator.CreateInstance(_dotNetFromAlNotSupportedExceptionType!, inner.Message, inner)!;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object Replacement_TestRunnerInvokeAutomationMethod(object self, object request)
+    {
+        // Only a handle from the replacement above can reach this: every other create throws.
+        var methodName = _automationRequestMethodName!.GetValue(request) as string;
+        if (methodName == "IsAvailable" || methodName == "#IsNull")
+            return false;
+        throw ClientSideDotNetNotSupported();
+    }
+
+    // ========================================================================
+    // Patch #32b: NavDatabaseSecurityAndLicense.Dispose(bool) — the lock half of #32
+    // ------------------------------------------------------------------------
+    //   protected virtual void Dispose(bool disposing) {
+    //       if (!isDisposed && disposing) {
+    //           if (licenseLock != null) licenseLock.Dispose();
+    //           if (license != null) { license.Dispose(); license = null; }
+    //           isDisposed = true;
+    //       }
+    //   }
+    //
+    // GetLicensePermissions runs licenseLock.EnterReadLock() … ExitReadLock(), then the
+    // unlocked license lookup that Patch #32 protects, then EnterUpgradeableReadLock() …
+    // EnterWriteLock(). Patch #32 only covers the middle step. A teardown that wins the race
+    // against either Enter throws ObjectDisposedException from ReaderWriterLockSlim instead —
+    // same trigger, same session, a differently-spelled flake. Both halves have to go.
+    //
+    // Unlike #32, this one does skip a genuine Dispose: the ReaderWriterLockSlim's. Why that
+    // is an acceptable trade rather than a leak:
+    //
+    //   * ReaderWriterLockSlim owns no OS handle directly. Its Dispose releases up to three
+    //     lazily-created wait events, which the finalizer reclaims anyway. Most .NET code
+    //     never disposes one at all.
+    //   * There is one per NavDatabase, not one per session or per request.
+    //   * `license = null` and `isDisposed = true` are bookkeeping. `isDisposed` is read in
+    //     exactly one place — this method (verified by field-usage scan). The owning
+    //     NavDatabase drops its securityAndLicense reference regardless, so the lock, the
+    //     license, the dataReader and the permission memo all become unreachable together.
+    //   * NavDatabaseSecurityAndLicense has no derived types in Nav.Ncl (checked), so hooking
+    //     this `protected virtual` cannot be routed around by an override.
+    //
+    // Applied on every BC version. Method body verified byte-identical on 27.0 and 28.0.
+    // ========================================================================
+    private static void PatchNavDatabaseSecurityAndLicenseDispose(Assembly navNcl)
+    {
+        if (IsPatchDisabled("32b")) return;
+        try
+        {
+            var type = navNcl.GetType("Microsoft.Dynamics.Nav.Runtime.NavDatabaseSecurityAndLicense");
+            if (type == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32b: NavDatabaseSecurityAndLicense type not found — skipping");
+                return;
+            }
+
+            var dispose = type.GetMethod("Dispose",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+                binder: null, types: new[] { typeof(bool) }, modifiers: null);
+            if (dispose == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32b: NavDatabaseSecurityAndLicense.Dispose(bool) not found — skipping");
+                return;
+            }
+
+            // Shape check: back off if the fields we reasoned about are gone — a changed
+            // field set is the signal that Microsoft gave this type a real resource to
+            // release, and skipping it would then be a genuine leak rather than a hint.
+            var lockField = type.GetField("licenseLock",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var licenseField = type.GetField("license",
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (lockField == null || licenseField == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #32b: NavDatabaseSecurityAndLicense field shape changed — skipping");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_NoOp_ObjectBool),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(dispose, replacement, "NavDatabaseSecurityAndLicense.Dispose (Patch #32b)");
+            Console.WriteLine("[StartupHook] Patch #32b: NavDatabaseSecurityAndLicense.Dispose(bool) no-op'd (licenseLock teardown vs. in-flight session)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #32b failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     // ========================================================================
     // Patch #29: NavDirectorySecurity.CreateSecurityForDomainDirectory
     // ------------------------------------------------------------------------
@@ -3601,6 +5799,602 @@ internal class StartupHook
         {
             Console.WriteLine($"[StartupHook] Patch #29 failed: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    // ========================================================================
+    // Patch #31: LanguageHelper..ctor — complete the three-letter language table
+    // on ICU (GitHub issue #52: Chinese captions inside English error messages)
+    // ------------------------------------------------------------------------
+    // Symptom: "標題 must have a value in 所有設定檔: 範圍=租用戶, …" — the message
+    // template is English (session language really is 1033) but every caption
+    // of a PLATFORM table (All Profile, User, Company, their fields and option
+    // values) comes back in Traditional Chinese. Base Application tables are
+    // fine.
+    //
+    // Mechanism (all verified against a live 27.0 container):
+    //   * Platform table metadata lives in the System package embedded in
+    //     Microsoft.BusinessCentral.SystemApp.dll. Its captions are CaptionML
+    //     strings keyed by Windows three-letter language names, alphabetically
+    //     ordered: "BGR=…;CHS=…;CHT=所有設定檔;CSY=…;…;ENU=All Profile;…".
+    //   * MultiLanguage.Parse turns each abbreviation into an LCID with
+    //     LanguageHelper.GetLanguageIdByAbbreviatedName, which returns
+    //     NavResourceManager.DefaultLanguageId (1033) for anything it doesn't
+    //     know.
+    //   * LanguageHelper's table comes from WindowsLanguageHelper.AllCultures =
+    //     CultureInfo.GetCultures(AllCultures) filtered by ValidLanguageId
+    //     (1024 ≤ LCID ≤ 61439, LCID % 1024 ≠ 0). On Linux .NET runs on ICU,
+    //     which enumerates Chinese only as script-qualified cultures
+    //     (zh-Hant-TW, zh-Hans-CN, zh-Hant-HK, …) with LCID 4096 — filtered
+    //     out — while plain zh-TW (1028, "CHT") is never enumerated at all.
+    //     Microsoft already special-cases 2052 (zh-CN) and 1034 in
+    //     SpecialCultures; 1028 has no such entry.
+    //   * So "CHT" → 1033, the parsed MultiLanguage holds TWO 1033 entries,
+    //     the Chinese one first, and both MultiLanguage.GetText and
+    //     NCLLookupArray.TryGetValue are first-match. English never wins.
+    //
+    // Fix: hook the private LanguageHelper constructor and fill its two
+    // dictionaries ourselves from AllCultures PLUS the cultures ICU hides
+    // (found by stripping the script subtag from every LCID-less
+    // lang-Script-REGION culture and re-resolving it), iterated in LCID order
+    // exactly like the original. Net effect on 27.0/W1: CHT → 1028 and
+    // ZHH → 3076 (zh-HK, which Windows also picks over zh-Hant/31748); every
+    // other abbreviation in the platform's CaptionML resolves as before. On
+    // Windows the augmentation finds nothing and the table is byte-identical.
+    //
+    // Deliberately NOT done: forcing English. The fix corrects the data, not
+    // the language selection, so GLOBALLANGUAGE(1028) in a test still yields
+    // Chinese captions — which is now the correct answer instead of an
+    // accident.
+    //
+    // Hook target choice: the ctor has a loop and ~120 bytes of IL, so the
+    // JIT will not inline it (Patch #22 already relies on ctor hooks).
+    // LanguageHelper.GetLanguageIdByAbbreviatedName and
+    // WindowsLanguageHelper.GetDistinctCultures are both tiny and would be
+    // inlined into their same-assembly callers, defeating a JMP hook.
+    // ========================================================================
+    private static bool _patchedLanguageHelper;
+    private static Type? _languageHelperType;
+    private static Type? _windowsLanguageHelperType;
+
+    private static void PatchLanguageHelperCultureTable(Assembly navTypes)
+    {
+        if (_patchedLanguageHelper || IsPatchDisabled("31")) return;
+        try
+        {
+            _languageHelperType = navTypes.GetType("Microsoft.Dynamics.Nav.Types.LanguageHelper");
+            _windowsLanguageHelperType = navTypes.GetType("Microsoft.Dynamics.Nav.Types.WindowsLanguageHelper");
+            if (_languageHelperType == null || _windowsLanguageHelperType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #31: LanguageHelper/WindowsLanguageHelper not found — skipped");
+                return;
+            }
+
+            var ctor = _languageHelperType.GetConstructor(
+                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public, null, Type.EmptyTypes, null);
+            var namesField = _languageHelperType.GetField("languageThreeLetterNames", BindingFlags.Instance | BindingFlags.NonPublic);
+            var idsField = _languageHelperType.GetField("languageIdsByAbbreviatedNames", BindingFlags.Instance | BindingFlags.NonPublic);
+            var allCulturesField = _windowsLanguageHelperType.GetField("AllCultures", BindingFlags.Static | BindingFlags.Public);
+            if (ctor == null || namesField == null || idsField == null || allCulturesField == null
+                || namesField.FieldType != typeof(Dictionary<int, string>)
+                || idsField.FieldType != typeof(Dictionary<string, int>)
+                || allCulturesField.FieldType != typeof(CultureInfo[]))
+            {
+                // The shape we replicate has changed — better to leave the stock ctor alone
+                // than to construct a LanguageHelper we don't understand.
+                Console.WriteLine("[StartupHook] Patch #31: LanguageHelper shape not recognised — skipped");
+                return;
+            }
+
+            var replacement = typeof(StartupHook).GetMethod(nameof(Replacement_LanguageHelperCtor),
+                BindingFlags.Public | BindingFlags.Static)!;
+            ApplyJmpHook(ctor, replacement, "LanguageHelper..ctor (Patch #31)");
+            _patchedLanguageHelper = true;
+            Console.WriteLine("[StartupHook] Patch #31: LanguageHelper..ctor hooked (ICU-complete language table)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #31 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replaces the private LanguageHelper() constructor. Same algorithm as the
+    /// original (iterate cultures in LCID order, first abbreviation wins), over
+    /// WindowsLanguageHelper.AllCultures plus the cultures ICU does not enumerate.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void Replacement_LanguageHelperCtor(object self)
+    {
+        var helperType = _languageHelperType ?? self.GetType();
+        var namesField = helperType.GetField("languageThreeLetterNames", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var idsField = helperType.GetField("languageIdsByAbbreviatedNames", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        // Reading the static field runs WindowsLanguageHelper's cctor if needed — exactly
+        // what the original ctor's first line (AllCultures.Length) does.
+        var allCultures = (CultureInfo[])_windowsLanguageHelperType!
+            .GetField("AllCultures", BindingFlags.Static | BindingFlags.Public)!.GetValue(null)!;
+
+        List<CultureInfo> extras;
+        try
+        {
+            extras = FindCulturesHiddenByIcu(allCultures, ReadPseudoLanguageIds());
+        }
+        catch (Exception ex)
+        {
+            // Never let the augmentation take LanguageHelper down with it; fall back to the
+            // stock table (i.e. the pre-patch behaviour).
+            Console.WriteLine($"[StartupHook] Patch #31: culture augmentation failed, using stock table: {ex.GetType().Name}: {ex.Message}");
+            extras = new List<CultureInfo>();
+        }
+
+        // AllCultures is sorted by LCID (CultureInfoComparer); keep that order after merging so
+        // the "first abbreviation wins" rule picks the same culture Windows would.
+        var merged = allCultures.Concat(extras).OrderBy(c => c.LCID).ToList();
+        var names = new Dictionary<int, string>(merged.Count);
+        var ids = new Dictionary<string, int>(merged.Count);
+        foreach (var culture in merged)
+        {
+            int lcid = culture.LCID;
+            string abbrev = culture.ThreeLetterWindowsLanguageName;
+            // Original: skip when the abbreviation is taken. The LCID guard is extra: the
+            // original's Dictionary.Add would throw on a duplicate LCID, and a throwing
+            // ctor would leave BC without any language table at all.
+            if (ids.ContainsKey(abbrev) || names.ContainsKey(lcid)) continue;
+            names.Add(lcid, abbrev);
+            ids.Add(abbrev, lcid);
+        }
+
+        namesField.SetValue(self, names);
+        idsField.SetValue(self, ids);
+
+        Console.WriteLine(extras.Count == 0
+            ? $"[StartupHook] Patch #31: language table built from {allCultures.Length} cultures (nothing to add on this runtime)"
+            : $"[StartupHook] Patch #31: language table built from {allCultures.Length} cultures + {extras.Count} ICU-hidden: "
+              + string.Join(", ", extras.Select(c => $"{c.Name}/{c.LCID}/{c.ThreeLetterWindowsLanguageName}")));
+    }
+
+    private static int[] ReadPseudoLanguageIds()
+    {
+        try
+        {
+            return _windowsLanguageHelperType?
+                .GetField("PseudoLanguages", BindingFlags.Static | BindingFlags.NonPublic)?
+                .GetValue(null) as int[] ?? Array.Empty<int>();
+        }
+        catch
+        {
+            return Array.Empty<int>();
+        }
+    }
+
+    /// <summary>
+    /// Cultures that Windows NLS enumerates but ICU only exposes under a
+    /// script-qualified name with no LCID: for every lang-Script-REGION culture
+    /// whose LCID is 4096, try lang-REGION. Returns only cultures that carry a
+    /// real Windows LCID and three-letter name and are not already known.
+    /// Empty on Windows, where GetCultures already yields zh-TW, zh-HK, ….
+    /// </summary>
+    internal static List<CultureInfo> FindCulturesHiddenByIcu(IReadOnlyCollection<CultureInfo> known, int[] pseudoLanguageIds)
+    {
+        const int LocaleCustomUnspecified = 4096;
+        var knownNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var knownLcids = new HashSet<int>();
+        foreach (var c in known)
+        {
+            knownNames.Add(c.Name);
+            knownLcids.Add(c.LCID);
+        }
+
+        var result = new List<CultureInfo>();
+        foreach (var culture in CultureInfo.GetCultures(CultureTypes.AllCultures))
+        {
+            if (culture.LCID != LocaleCustomUnspecified) continue;
+            var parts = culture.Name.Split('-');
+            if (parts.Length != 3 || parts[1].Length != 4) continue; // lang-Script-REGION only
+            var stripped = parts[0] + "-" + parts[2];
+            if (knownNames.Contains(stripped)) continue;
+
+            CultureInfo candidate;
+            try { candidate = CultureInfo.GetCultureInfo(stripped); }
+            catch (CultureNotFoundException) { continue; }
+
+            int lcid = candidate.LCID;
+            // Mirrors WindowsLanguageHelper.ValidLanguageId.
+            if (lcid < 1024 || lcid > 61439 || lcid % 1024 == 0) continue;
+            if (Array.IndexOf(pseudoLanguageIds, lcid) >= 0) continue;
+            if (knownLcids.Contains(lcid)) continue;
+            var abbrev = candidate.ThreeLetterWindowsLanguageName;
+            if (string.IsNullOrEmpty(abbrev) || abbrev == "ZZZ") continue; // no Windows name known
+
+            knownNames.Add(stripped);
+            knownLcids.Add(lcid);
+            result.Add(candidate);
+        }
+        return result;
+    }
+
+
+    /// <summary>
+    /// Patch #30: the Dev Services (/BC/dev/*) endpoint never sends a WWW-Authenticate
+    /// header on a 401, unlike /BC/ODataV4/* (confirmed empirically — OData correctly
+    /// returns "Www-Authenticate: Basic realm=..."; Dev returns a bare 401 with zero
+    /// headers). Root cause: NavAuthenticationHandler.HandleAuthenticateAsync
+    /// (Microsoft.Dynamics.Nav.Service.AspNetCore.dll) sets Response.StatusCode = 401
+    /// directly inside its own catch blocks on a failed/missing Authorization header,
+    /// short-circuiting BEFORE the standard ASP.NET Core Challenge flow
+    /// (AuthenticationHandler&lt;T&gt;.HandleChallengeAsync, where a header would
+    /// normally get added) ever runs. Confirmed: a JMP-hook on HandleChallengeAsync with
+    /// a debug log line never printed even once across repeated failed requests — that
+    /// method genuinely never executes for this failure path.
+    ///
+    /// This breaks any client doing proper HTTP challenge-response Basic auth
+    /// negotiation (send unauthenticated -> read WWW-Authenticate -> resend with
+    /// credentials) instead of sending credentials proactively. .NET's own
+    /// HttpClientHandler.Credentials is exactly such a client, and so — per the
+    /// decompiled ms-dynamics-smb.al extension.js (UserPasswordAuth/
+    /// ServerProxy.onErrorAsync) — is VS Code's/al.nvim's actual publish flow: it
+    /// authenticates reactively off a 401, but with no challenge header the .NET HTTP
+    /// stack can never determine which scheme to use, so it never attaches Basic auth
+    /// and the request stays unauthenticated no matter how many times valid credentials
+    /// are supplied. curl works fine because `-u` sends Basic auth proactively, with no
+    /// negotiation — which is why publish-workspace.sh (curl-based) was never affected.
+    ///
+    /// Rejected fix: patching HandleAuthenticateAsync itself would require faithfully
+    /// re-invoking Microsoft.Dynamics.Nav.Service.AspNetCore.Middlewares.
+    /// AuthenticationHelper.AuthenticateForServiceCallAsync (an internal class with
+    /// several overloads, delegate params, tenant/token/impersonation logic, ALSO used
+    /// by SignalR and Windows auth on the same endpoint) via pure reflection — high risk
+    /// of subtly breaking other auth paths on this handler for a fix this narrow.
+    ///
+    /// Actual fix: DevTenantAuthorizationMiddleware (Microsoft.Dynamics.Nav.Service.Dev.dll)
+    /// is registered AFTER UseAuthentication() but BEFORE UseRouting()/UseAuthorization()
+    /// in DevHostStartup.Configure — i.e. it runs unconditionally on every Dev request
+    /// regardless of auth outcome, wrapping a genuine `next` RequestDelegate we CAN call
+    /// (unlike the auth handler, which has no such passthrough). Hook its InvokeAsync to
+    /// register an HttpResponse.OnStarting callback (the header must be added there, NOT
+    /// after next() returns — by then the downstream response has already been flushed;
+    /// confirmed empirically with a standalone repro that a post-next() header-set is
+    /// silently dropped) that adds the header if status ends up 401, then call the real
+    /// `next`.
+    ///
+    /// Decompiled the actual method body (ICSharpCode.Decompiler against the shipped
+    /// Microsoft.Dynamics.Nav.Service.Dev.dll) to verify what's being skipped, rather than
+    /// assume it. The ENTIRE body — both the SaaS extension-target check and the
+    /// prod-tenant "DevEndpointCalledForProdTenantMetric" / 405 check — is gated behind
+    /// one outer `if (ServerUserSettings.Instance.EnableMembershipEntitlement.Value)`, and
+    /// falls straight through to `return next(context)` when that flag is false. On an
+    /// OnPrem container this flag is false, so replicating that fallthrough is correct —
+    /// but the replacement now re-checks the SAME flag via reflection on every request
+    /// instead of assuming it's always false. It can't safely fall back to "the original
+    /// method" if the flag is ever true (JMP hooking overwrote that method's own entry
+    /// point in place — there's no surviving original to call), so it fails CLOSED
+    /// (500, loudly logged) instead. See Replacement_DevTenantAuthorizationInvokeAsync's
+    /// header comment for the full reasoning.
+    /// </summary>
+    private static void PatchNavAuthenticationChallenge(Assembly navServiceDevAsm)
+    {
+        if (IsPatchDisabled("30")) return;
+        try
+        {
+            var middlewareType = navServiceDevAsm.GetType("Microsoft.Dynamics.Nav.Service.Dev.Web.DevTenantAuthorizationMiddleware");
+            if (middlewareType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: DevTenantAuthorizationMiddleware not found, skipping");
+                return;
+            }
+
+            var invokeMethod = middlewareType.GetMethod("InvokeAsync",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (invokeMethod == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: InvokeAsync not found, skipping");
+                return;
+            }
+
+            // Cache all reflection lookups now, once, rather than paying MemberInfo
+            // resolution cost on every Dev Services request inside the replacement.
+            _devTenantAuthNextField = middlewareType.GetField("next", BindingFlags.Instance | BindingFlags.NonPublic);
+            if (_devTenantAuthNextField == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: 'next' field not found, skipping");
+                return;
+            }
+
+            var httpContextType = invokeMethod.GetParameters()[0].ParameterType; // Microsoft.AspNetCore.Http.HttpContext
+            _httpContextResponseProperty = httpContextType.GetProperty("Response");
+            var httpResponseType = _httpContextResponseProperty?.PropertyType; // Microsoft.AspNetCore.Http.HttpResponse
+            if (httpResponseType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: HttpContext.Response property not found, skipping");
+                return;
+            }
+            _httpResponseStatusCodeProperty = httpResponseType.GetProperty("StatusCode");
+            _httpResponseHeadersProperty = httpResponseType.GetProperty("Headers");
+            _httpResponseOnStartingMethod = httpResponseType.GetMethod("OnStarting", new[] { typeof(Func<Task>) });
+            // HttpResponse.Headers is DECLARED as IHeaderDictionary itself (not some
+            // concrete type that implements it), so the interface we want IS the
+            // declared property type — Type.GetInterfaces() only returns interfaces a
+            // type EXTENDS, never itself, so calling it here would (and did) return
+            // nothing. The runtime instance returned by GetValue is Kestrel's concrete
+            // HttpResponseHeaders, but resolving members against the interface type
+            // directly (known statically, no instance needed) is equivalent and cheaper.
+            var iHeaderDictionaryType = _httpResponseHeadersProperty?.PropertyType;
+            if (iHeaderDictionaryType == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: HttpResponse.Headers property not found, skipping");
+                return;
+            }
+            // ContainsKey(string) is declared on IDictionary<string, StringValues>, which
+            // IHeaderDictionary extends — GetMethod on an interface type does NOT search
+            // inherited interfaces, so it must be looked up on the base interface
+            // explicitly (confirmed: iHeaderDictionaryType.GetMethod("ContainsKey")
+            // returned null on a live container even though the interface type itself
+            // was resolved correctly). This project has no compile-time reference to
+            // ASP.NET Core/Microsoft.Extensions.Primitives, so the base interface is
+            // found purely via reflection over iHeaderDictionaryType.GetInterfaces()
+            // rather than a typeof(IDictionary&lt;string, StringValues&gt;) literal.
+            var iDictionaryStringStringValues = iHeaderDictionaryType.GetInterfaces()
+                .FirstOrDefault(i => i.IsGenericType
+                    && i.GetGenericTypeDefinition() == typeof(System.Collections.Generic.IDictionary<,>)
+                    && i.GetGenericArguments()[0] == typeof(string));
+            _headerDictionaryContainsKeyMethod = iHeaderDictionaryType.GetMethod("ContainsKey")
+                ?? iDictionaryStringStringValues?.GetMethod("ContainsKey");
+            _headerDictionaryIndexer = iHeaderDictionaryType.GetProperty("Item", new[] { typeof(string) });
+            var stringValuesType = _headerDictionaryIndexer?.PropertyType; // Microsoft.Extensions.Primitives.StringValues
+            _stringValuesCtor = stringValuesType?.GetConstructor(new[] { typeof(string) });
+
+            if (_httpResponseStatusCodeProperty == null || _httpResponseHeadersProperty == null
+                || _httpResponseOnStartingMethod == null || _headerDictionaryContainsKeyMethod == null
+                || _headerDictionaryIndexer == null || _stringValuesCtor == null)
+            {
+                Console.WriteLine("[StartupHook] Patch #30: one or more required members not found, skipping " +
+                    $"(StatusCode={_httpResponseStatusCodeProperty != null}, Headers={_httpResponseHeadersProperty != null}, " +
+                    $"OnStarting={_httpResponseOnStartingMethod != null}, ContainsKey={_headerDictionaryContainsKeyMethod != null}, " +
+                    $"Indexer={_headerDictionaryIndexer != null}, StringValuesCtor={_stringValuesCtor != null}, " +
+                    $"iHeaderDictionaryType={iHeaderDictionaryType.FullName})");
+                return;
+            }
+
+            // NOTE: we do NOT keep a reference to `invokeMethod` to "call the original
+            // later" — ApplyJmpHook overwrites this exact method's entry point (both the
+            // precode AND, where found, the compiled code) in place. A MethodInfo.Invoke
+            // against it post-hook would just re-enter our own replacement and recurse
+            // forever. See Replacement_DevTenantAuthorizationInvokeAsync's header comment
+            // for how the EnableMembershipEntitlement-true case is actually handled.
+
+            var replacement = typeof(StartupHook).GetMethod(
+                nameof(Replacement_DevTenantAuthorizationInvokeAsync),
+                BindingFlags.Static | BindingFlags.NonPublic)!;
+            ApplyJmpHook(invokeMethod, replacement, "DevTenantAuthorizationMiddleware.InvokeAsync (Patch #30)");
+            Console.WriteLine("[StartupHook] Patch #30: Dev Services 401 responses now include WWW-Authenticate: Basic");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #30 failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Replacement for DevTenantAuthorizationMiddleware.InvokeAsync(HttpContext context).
+    /// Instance method, one reference-type parameter -- JMP hooks pass 'this' as the first
+    /// explicit parameter (see Replacement_ShowForm's header comment for the general
+    /// pattern), so the real signature here is (self, context).
+    ///
+    /// The original method's body is ENTIRELY gated behind
+    /// ServerUserSettings.Instance.EnableMembershipEntitlement.Value (verified by
+    /// decompiling the shipped DLL — see PatchNavAuthenticationChallenge's header
+    /// comment). We can NOT call "the original method" when that flag is true: JMP
+    /// hooking overwrites this exact method's entry point (precode AND, where found,
+    /// the already-compiled code) in place — there is no surviving trampoline to the
+    /// pre-hook body, and a reflection Invoke against the same MethodInfo would just
+    /// re-enter this replacement and recurse forever. So when the flag is false (the
+    /// expected OnPrem case) we go straight to registering the OnStarting callback and
+    /// calling `next(context)`, matching the original's own fallthrough exactly. When
+    /// the flag is unexpectedly true, we deliberately fail CLOSED — log loudly and
+    /// return 500 — rather than silently either (a) skip the SaaS/prod-tenant checks
+    /// this patch was never validated against, or (b) pretend to call code that no
+    /// longer exists at this entry point.
+    ///
+    /// Deliberately NOT an `async` method, and does NOT await/ContinueWith on next's Task.
+    /// Every other JMP-hooked replacement in this file is fully synchronous; an earlier
+    /// version of this patch used an `async` local function and every request hung until
+    /// timeout (504) with no exception logged, even though the replacement was confirmed
+    /// entered via a debug log. Given DOTNET_TieredCompilation=0 is set file-wide
+    /// specifically because JMP hooks are sensitive to how the JIT compiles the hooked
+    /// method (see the top-level header comment), an async state machine's fundamentally
+    /// different codegen next to a raw-pointer JMP replacement is the leading suspect —
+    /// not confirmed at the IL level, but avoiding async entirely here matches the same
+    /// caution this file already applies everywhere else, and it fixed the hang.
+    ///
+    /// Downstream exceptions from `next` are allowed to propagate, matching what the
+    /// original method itself does (`return next(context)`, no try/catch). An earlier
+    /// version wrapped `next`'s invocation in try/catch and returned Task.CompletedTask
+    /// on failure — `nextDelegate.DynamicInvoke` wraps any SYNCHRONOUS exception thrown
+    /// before the callee's first await in a TargetInvocationException, and that catch
+    /// swallowed it, turning what should surface as a 500 (or propagate to whatever
+    /// caller awaits this Task) into a silent 200. Only our OWN reflection setup (the
+    /// OnStarting registration, run before `next` is ever reached) is wrapped in
+    /// try/catch — a failure there must not drop the request.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static object Replacement_DevTenantAuthorizationInvokeAsync(object self, object context)
+    {
+        // Re-check the same flag the original method gates its entire body on, every
+        // request — don't assume the container's entitlement configuration never
+        // changes. See this method's header comment for why the true case fails
+        // closed instead of trying to call "the original" (there is no safe way to).
+        if (IsMembershipEntitlementEnabled())
+        {
+            Console.WriteLine("[StartupHook] Patch #30: EnableMembershipEntitlement is set — " +
+                "this patch was only validated for the OnPrem (flag-false) case and the " +
+                "original SaaS/prod-tenant checks can no longer be reached through this " +
+                "hooked entry point. Failing the request closed (500) instead of silently " +
+                "skipping those checks.");
+            return FailClosed(context);
+        }
+
+        var next = _devTenantAuthNextField!.GetValue(self);
+        if (next == null)
+        {
+            Console.WriteLine("[StartupHook] Patch #30: RequestDelegate 'next' field not found — request dropped");
+            return Task.CompletedTask;
+        }
+
+        // Register the header-fixup via HttpContext.Response.OnStarting — the
+        // documented mechanism for adding/modifying a header right before the
+        // response actually starts, regardless of which downstream component
+        // decided the status code. Registering AFTER next() returns is too late —
+        // by then the response is already flushed and header mutations are silently
+        // dropped (confirmed with a standalone minimal-repro ASP.NET Core app before
+        // touching this file again, after that exact failure mode wedged the whole
+        // Dev host on a live container). Only this registration step is try/caught —
+        // see the header comment on why `next` itself must not be.
+        try
+        {
+            var response = _httpContextResponseProperty!.GetValue(context);
+            if (response != null)
+            {
+                Func<Task> callback = () =>
+                {
+                    try
+                    {
+                        AddChallengeHeaderIfNeeded(response);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[StartupHook] Patch #30: OnStarting header fixup failed: {ex.GetType().Name}: {ex.Message}");
+                    }
+                    return Task.CompletedTask;
+                };
+                _httpResponseOnStartingMethod!.Invoke(response, new object[] { callback });
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #30: OnStarting registration failed: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        // next is a RequestDelegate (Func<HttpContext, Task>) — invoke it directly as
+        // a delegate (Delegate.DynamicInvoke), NOT via MethodInfo.Invoke on its
+        // "Invoke" method; DynamicInvoke is the documented reflection-safe way to
+        // call an arbitrary delegate instance without needing its exact static type.
+        // Deliberately NOT wrapped in try/catch — see this method's header comment.
+        var nextDelegate = (Delegate)next;
+        try
+        {
+            return (Task)nextDelegate.DynamicInvoke(context)!;
+        }
+        catch (TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            // DynamicInvoke always wraps synchronous exceptions from the callee in a
+            // TargetInvocationException. Unwrap so the original exception type/stack
+            // propagates to whatever awaits this Task, matching what a direct
+            // `next(context)` call (no reflection) would have thrown.
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+            throw; // unreachable, satisfies the compiler
+        }
+    }
+
+    /// <summary>
+    /// True if ServerUserSettings.Instance.EnableMembershipEntitlement.Value is set.
+    /// Resolved fully via reflection on every call rather than cached at patch-apply
+    /// time, since — unlike the structural MethodInfo/PropertyInfo lookups cached in
+    /// PatchNavAuthenticationChallenge — this is a runtime VALUE that can change while
+    /// the process is up. If reflection fails for any reason, fail CLOSED (return true,
+    /// which routes the caller to FailClosed/500) rather than silently keep behaving as
+    /// if the flag were false — we'd rather break loudly on an unexpected shape than
+    /// quietly skip checks we can no longer prove don't apply.
+    /// </summary>
+    private static bool IsMembershipEntitlementEnabled()
+    {
+        try
+        {
+            // Verified via decompile: the type is Microsoft.Dynamics.Nav.Types.ServerUserSettings
+            // (NOT .Runtime — the decompiler's own `using` list for the middleware class
+            // pulled in several ...Runtime namespaces for OTHER types, which is what led
+            // to guessing this one wrong the first time; always re-check the specific
+            // type's own namespace, not a neighboring type's usings).
+            Type? settingsType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                settingsType = asm.GetType("Microsoft.Dynamics.Nav.Types.ServerUserSettings");
+                if (settingsType != null) break;
+            }
+            var instanceProp = settingsType?.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public);
+            var instance = instanceProp?.GetValue(null);
+            var entitlementProp = instance?.GetType().GetProperty("EnableMembershipEntitlement");
+            var entitlementSetting = entitlementProp?.GetValue(instance);
+            var valueProp = entitlementSetting?.GetType().GetProperty("Value");
+            var value = valueProp?.GetValue(entitlementSetting);
+            if (value is bool b) return b;
+
+            Console.WriteLine("[StartupHook] Patch #30: could not resolve EnableMembershipEntitlement " +
+                $"(settingsType={settingsType?.FullName}, instance={instance != null}, " +
+                $"entitlementSetting={entitlementSetting != null}, value={value}) — failing closed");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #30: EnableMembershipEntitlement check failed ({ex.GetType().Name}: {ex.Message}) — failing closed");
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Fail-closed path for the EnableMembershipEntitlement-true case: set 500 and
+    /// return a completed response body via reflection, without touching `next` at
+    /// all. See Replacement_DevTenantAuthorizationInvokeAsync's header comment for why
+    /// this is the safe choice over trying to reach code this JMP hook overwrote.
+    /// </summary>
+    private static object FailClosed(object context)
+    {
+        try
+        {
+            var response = _httpContextResponseProperty!.GetValue(context);
+            if (response != null)
+            {
+                _httpResponseStatusCodeProperty!.SetValue(response, 500);
+                var writeAsyncMethod = response.GetType().GetMethod("WriteAsync", new[] { typeof(string) });
+                var task = writeAsyncMethod?.Invoke(response, new object[] { string.Empty });
+                if (task is Task t) return t;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[StartupHook] Patch #30: FailClosed itself failed: {ex.GetType().Name}: {ex.Message}");
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// If the response ends up as a 401 with no WWW-Authenticate header yet, add one.
+    /// Uses the MemberInfo cached once in PatchNavAuthenticationChallenge rather than
+    /// re-resolving reflection on every request.
+    ///
+    /// The header-dictionary indexer lookup MUST go through the IHeaderDictionary
+    /// INTERFACE type, not the concrete runtime type. Kestrel's concrete implementation
+    /// (Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http.HttpResponseHeaders)
+    /// implements the string indexer as an EXPLICIT interface implementation of
+    /// IHeaderDictionary.this[string] — GetType().GetProperty("Item", ...) on the
+    /// concrete type returns null and any attempt to use it silently no-ops. Confirmed
+    /// with a standalone repro: the status-code reflection set worked immediately, but
+    /// the header value came back empty every time until the indexer was looked up via
+    /// concreteType.GetInterfaces().First(i => i.Name == "IHeaderDictionary") instead.
+    /// </summary>
+    private static void AddChallengeHeaderIfNeeded(object response)
+    {
+        var statusCode = (int?)_httpResponseStatusCodeProperty!.GetValue(response);
+        if (statusCode != 401) return;
+
+        var headers = _httpResponseHeadersProperty!.GetValue(response);
+        if (headers == null) return;
+
+        var alreadyHasChallenge = (bool?)_headerDictionaryContainsKeyMethod!.Invoke(headers, new object[] { "WWW-Authenticate" }) ?? false;
+        if (alreadyHasChallenge) return;
+
+        var stringValues = _stringValuesCtor!.Invoke(new object[] { "Basic realm=\"\"" });
+        _headerDictionaryIndexer!.SetValue(headers, stringValues, new object[] { "WWW-Authenticate" });
+        Console.WriteLine("[StartupHook] Patch #30: added WWW-Authenticate to a Dev Services 401 response");
     }
 
 

@@ -9,7 +9,7 @@ name: BC test (from source) [reusable]
 #   on: [push, pull_request, workflow_dispatch]
 #   jobs:
 #     test:
-#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
+#       uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-from-source.yml@master
 #       with:
 #         bc_version:     "27.5"
 #         app_dirs:       "app"
@@ -132,12 +132,12 @@ on:
         type: boolean
         default: false
       app_dirs:
-        description: "Space-separated dirs containing app.json for production apps (compile order)"
+        description: "Newline-separated dirs containing app.json for production apps (compile order). Newline, not space, because a dir name can itself contain a space."
         required: false
         type: string
         default: ""
       test_app_dirs:
-        description: "Space-separated dirs containing app.json for test apps"
+        description: "Newline-separated dirs containing app.json for test apps. Newline, not space, because a dir name can itself contain a space."
         required: true
         type: string
       extra_symbols_artifact_name:
@@ -177,6 +177,42 @@ on:
         description: >-
           Comma-separated preprocessor symbols passed to /define
           (e.g. "BC27PLUS,BC28PLUS"). Empty = no flag passed to the compiler.
+        required: false
+        type: string
+        default: ""
+      extra_apps:
+        description: >-
+          Newline-separated names of Microsoft apps from the BC artifact to
+          keep installed, together with their dependencies, although none of
+          your apps declares them (issue #125). The tier keeps only what your
+          apps need, so it can differ from a Windows container that has more
+          apps installed. Example: Tests-TestLibraries, whose codeunit 130011
+          "Backup Management" subscribes to GetDatabaseTableTriggerSetup and
+          so changes those results. A name that matches no app in the
+          artifact fails the job. Names are not case-sensitive. Each app that
+          is not already installed in the database costs a publish at boot:
+          Tests-TestLibraries ships no precompiled code and takes about 17s.
+          Empty (default) = no change.
+        required: false
+        type: string
+        default: ""
+      assembly_probing_paths:
+        description: >-
+          Newline-separated folders passed to the compiler as
+          /assemblyprobingpaths for every app it compiles, so an OnPrem app
+          can declare a DotNet assembly that ships in the BC artifact
+          (issue #123). app.json's assemblyProbingPaths is no help here:
+          recent compilers refuse it (AL0124). A relative entry is resolved
+          against the job's extracted artifact folder, so one setting works
+          for every BC version; an absolute entry is used as is. Shell globs
+          are expanded, which covers the version-numbered service folder.
+          The compiler searches each folder's subfolders too. An entry that
+          matches no folder fails the step. Example:
+            platform/Test Assemblies
+            platform/ServiceTier/PFiles64/Microsoft Dynamics NAV/*/Service
+          The first holds Newtonsoft.Json; the second holds
+          Microsoft.Dynamics.Nav.NavUserAccount and the Timer, NavEtwReceiver
+          and ClientExtensions add-ins. Empty = no flag passed.
         required: false
         type: string
         default: ""
@@ -230,10 +266,10 @@ on:
           (Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux on
           nuget.org). Accepts a policy keyword or an exact version.
           "matching" (default, same as blank): newest stable of the AL major
-          that matches bc_version (AL major = BC major - 11), falling back to
-          that major's newest prerelease when no stable exists — required for
-          a BC version still in preview, since BC 29 needs AL 18.x and there
-          is no stable 18.x.
+          that matches bc_version (AL major = BC major - 11 up to BC 29, and
+          AL major = BC major from BC 30), falling back to that major's newest
+          prerelease when no stable exists — required for a BC version still
+          in preview, such as BC 30, which has only 30.x betas.
           "latest": newest stable across all majors, regardless of bc_version.
           Use this when an app declares a runtime its own major's compiler
           rejects — runtime 16.1 is refused by AL 16.2.28.57946 (which accepts
@@ -284,6 +320,31 @@ on:
         required: false
         type: string
         default: "auto"
+      test_runner_codeunit_id:
+        description: >-
+          Run the test suite through this test runner codeunit, for example
+          130451 "Test Runner - Isol. Disabled" or a test app's own codeunit
+          with Subtype = TestRunner (BcContainerHelper's -testRunnerCodeunitId).
+          Blank (default) uses 130450 "Test Runner - Isol. Codeunit",
+          BcContainerHelper's default. Only the websocket runner
+          runs tests through a runner codeunit, so when this is set every
+          codeunit goes to it: test_runner=auto uses websocket for the whole
+          run, and test_runner=altool fails. Results come back in the same JUnit
+          format (issue #193).
+        required: false
+        type: string
+        default: ""
+      altool_transport:
+        description: >-
+          How the altool leg of test_runner=auto reaches the TestRunnerHub.
+          "auto" (default): one persistent connection for the whole leg, and
+          the per-codeunit `al runtests` process only if the hub cannot be
+          reached. "hub": the persistent connection, no fallback. "cli": a
+          new `al runtests` process, login and connection for every codeunit,
+          which was the default before and costs about 0.76 s per codeunit.
+        required: false
+        type: string
+        default: "auto"
       altool_version:
         description: >-
           Version of the Microsoft.Dynamics.BusinessCentral.Development.Tools
@@ -294,10 +355,15 @@ on:
         type: string
         default: "18.0.37.11445-beta"
       runner_image:
-        description: "Override the bc-runner image (defaults to the public ghcr.io tag)"
+        description: >-
+          Override the bc-runner image. Blank (default) uses the repository variable
+          IMAGE_NAMESPACE as ghcr.io/<IMAGE_NAMESPACE>/bc-runner:latest when it is set,
+          and otherwise docker-compose's own default. Passing the empty string through
+          is what makes the compose default apply: `${BC_RUNNER_IMAGE:-<default>}`
+          treats empty and unset alike.
         required: false
         type: string
-        default: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+        default: ""
       sql_image:
         description: >-
           Override the SQL Server image. Blank (default) uses bc-linux's
@@ -313,8 +379,26 @@ on:
         required: false
         type: string
         default: ""
+      rdlc_renderer:
+        description: >-
+          Turn on the opt-in Mono RDLC renderer (issue #73): sets BC_RDLC_RENDERER=mono for
+          the bc container and pulls the bc-runner:rdlc image (built with BC_WITH_RDLC=1)
+          unless runner_image is set. Needs rdlc_trust_layouts: true as well, or the job
+          fails.
+        required: false
+        type: boolean
+        default: false
+      rdlc_trust_layouts:
+        description: >-
+          Required with rdlc_renderer: true. The acknowledgement that the VB code in an
+          RDLC layout runs with the renderer's privileges (root in the bc container), since
+          Mono does not sandbox it. Sets BC_RDLC_TRUST_LAYOUTS=1. Kept as a separate input
+          on purpose, so turning on the renderer is never also the acknowledgement.
+        required: false
+        type: boolean
+        default: false
       bc_linux_ref:
-        description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts (master, a tag, or a commit SHA)"
+        description: "Git ref of aldevtools/MsDyn365Bc.On.Linux to check out for scripts (master, a tag, or a commit SHA)"
         required: false
         type: string
         default: "master"
@@ -323,6 +407,14 @@ on:
         required: false
         type: number
         default: 45
+      test_timeout_minutes:
+        description: >-
+          Overall time limit, in minutes, for each test phase (the --timeout of the
+          test runner scripts). Default 30. Raise it for a suite whose phase runs
+          longer; keep it below timeout_minutes.
+        required: false
+        type: number
+        default: 30
       health_timeout_minutes:
         description: >-
           How long to wait for the BC container to report healthy. Default 30.
@@ -419,6 +511,21 @@ on:
         type: string
         default: ""
 
+      verify_authentication:
+        description: >-
+          Opt-in. When true, runs scripts/test-authentication.sh against
+          the running BC container right after it becomes healthy — a
+          positive/negative NavUserPassword auth check pair that catches
+          a client-services wire-format regression before the
+          publish/smoke steps below run (those would otherwise pass even
+          with a broken or bypassed password check). False (default):
+          the step is skipped — not every consumer of this workflow
+          needs to test authentication on every run, so it doesn't run
+          unless asked for.
+        required: false
+        type: boolean
+        default: false
+
     secrets:
       bc_license:
         description: >-
@@ -441,7 +548,9 @@ jobs:
     # can't live on the calling job.
     continue-on-error: ${{ inputs.continue_on_error }}
     env:
-      BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      BC_RUNNER_IMAGE: ${{ inputs.runner_image || (inputs.rdlc_renderer && format('ghcr.io/{0}/bc-runner:rdlc', vars.IMAGE_NAMESPACE || 'aldevtools/msdyn365bc.on.linux')) || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
+      BC_RDLC_RENDERER: ${{ inputs.rdlc_renderer && 'mono' || '' }}
+      BC_RDLC_TRUST_LAYOUTS: ${{ inputs.rdlc_renderer && inputs.rdlc_trust_layouts && '1' || '' }}
       # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
       # default — `:-` treats empty and unset alike, so an unset input keeps
       # the mirror rather than resolving to an empty image name.
@@ -483,7 +592,7 @@ jobs:
       - name: Checkout MsDyn365Bc.On.Linux
         uses: actions/checkout@v4
         with:
-          repository: StefanMaron/MsDyn365Bc.On.Linux
+          repository: ${{ vars.BC_LINUX_REPOSITORY || 'aldevtools/MsDyn365Bc.On.Linux' }}
           ref: ${{ inputs.bc_linux_ref }}
           path: bc-linux
 
@@ -496,9 +605,15 @@ jobs:
       # operations on different hosts. Run them in parallel inside one
       # shell step to overlap their wall time (~50s artifacts ⊕ ~30s pull
       # ⇒ ~50s instead of ~80s sequential).
+      - name: Check the RDLC trust acknowledgement
+        if: ${{ inputs.rdlc_renderer && !inputs.rdlc_trust_layouts }}
+        run: |
+          echo "::error::rdlc_renderer: true also needs rdlc_trust_layouts: true. RDLC layout code runs unsandboxed as root in the bc container (see CLAUDE.md, RDLC rendering)."
+          exit 1
+
       - name: Download BC artifacts + pull docker images (parallel)
         env:
-          BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          BC_RUNNER_IMAGE: ${{ inputs.runner_image || (inputs.rdlc_renderer && format('ghcr.io/{0}/bc-runner:rdlc', vars.IMAGE_NAMESPACE || 'aldevtools/msdyn365bc.on.linux')) || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
@@ -542,6 +657,7 @@ jobs:
         env:
           APP_DIRS: ${{ inputs.app_dirs }}
           TEST_APP_DIRS: ${{ inputs.test_app_dirs }}
+          EXTRA_APPS: ${{ inputs.extra_apps }}
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin RESOLVE "Resolve apps to keep"
           # Walk the consumer's app.json files (production + test) AND
@@ -558,15 +674,21 @@ jobs:
           # Microsoft Test Runner and the entrypoint's TestRunnerExtension
           # publish would fail with AL1024 — exactly the bug that broke
           # the bc-copilot-blueprint debugging session before this fix.
-          ARGS="--app-json bc-linux/extensions/TestRunnerExtension/app.json"
-          for d in $APP_DIRS $TEST_APP_DIRS; do
+          ARGS=(--app-json bc-linux/extensions/TestRunnerExtension/app.json)
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             if [ -f "project/$d/app.json" ]; then
-              ARGS="$ARGS --app-json project/$d/app.json"
+              ARGS+=(--app-json "project/$d/app.json")
             fi
-          done
+          done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            if [ -n "${name//[[:space:]]/}" ]; then
+              ARGS+=(--extra-app-name "$name")
+            fi
+          done <<< "$EXTRA_APPS"
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
-            $ARGS \
+            "${ARGS[@]}" \
             --artifact-dir "$BC_ARTIFACTS_DIR")
           echo "Resolved keep set: $KEEP_IDS"
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
@@ -697,102 +819,18 @@ jobs:
       - name: Install AL compiler (Linux)
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin AL_INSTALL "Install AL compiler"
-          AL_TOOL="${{ inputs.al_tool_version }}"
-          BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
-          # A policy keyword resolves through the shared script; anything
-          # else is an exact version and is used as-is.
-          case "$AL_TOOL" in
-            ""|matching|latest|prerelease)
-              AL_POLICY="${AL_TOOL:-matching}"
-              AL_TOOL=""
-              ;;
-            *)
-              AL_POLICY=""
-              ;;
-          esac
-          if [ -z "$AL_TOOL" ]; then
-            # Resolved from nuget.org rather than a hardcoded table. AL major
-            # is BC major - 11, and the resolver prefers the newest stable of
-            # that major, falling back to the newest prerelease when no stable
-            # exists. That fallback is what makes a preview BC version
-            # buildable at all: BC 29 needs AL 18.x, and as of 2026-08 there
-            # is no stable 18.x on nuget.org — only 18.0.39.10160-beta.
-            #
-            # The old table covered BC 27 and 28 only; anything else fell
-            # through to a ::warning:: and the BC 27 compiler, which does not
-            # fail loudly — it compiles against the wrong platform and the
-            # errors point somewhere unrelated. The resolver returns the same
-            # versions the table did for 27 and 28, so this is a
-            # generalization of the previous behavior, not a new guess.
-            if ! AL_TOOL=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}" --policy "$AL_POLICY"); then
-              echo "::error::could not resolve an AL compiler version for BC ${{ inputs.bc_version }}"
-              exit 1
-            fi
+          # Resolution, package-shape fallback (Microsoft has been known to
+          # reshuffle where the compiler binary lives inside a BC preview's
+          # AL nupkg without warning — see install-al-compiler.sh's header
+          # for the specific incident this guards against) and the AL
+          # wrapper all live in the shared script so this logic exists in
+          # exactly one place across the reusable workflow and both
+          # examples/ pipelines.
+          if ! INSTALL_OUT=$(bash bc-linux/scripts/install-al-compiler.sh "${{ inputs.bc_version }}" "${{ inputs.al_tool_version }}"); then
+            exit 1
           fi
-          echo "Installing AL compiler $AL_TOOL"
-          PKG="microsoft.dynamics.businesscentral.development.tools.linux"
-          AL_TOOL_DIR=""
-
-          # Try dotnet global tool first (BC 27 / v16 packages ship with
-          # DotnetToolSettings.xml and install correctly this way).
-          # BC 28+ dropped the tool manifest — the package is now a plain
-          # library nupkg and `dotnet tool install` rejects it; fall through
-          # to the nupkg-extraction path in that case.
-          if dotnet tool install -g \
-              Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux \
-              --version "$AL_TOOL" 2>&1 \
-          || dotnet tool update -g \
-              Microsoft.Dynamics.BusinessCentral.Development.Tools.Linux \
-              --version "$AL_TOOL" 2>&1; then
-            echo "Installed as dotnet global tool"
-            echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
-            # Locate alc by searching for it rather than assuming a TFM
-            # directory — see the comment on the extraction path below.
-            AL_TOOL_DIR=$(dirname "$(find "$HOME/.dotnet/tools/.store/$PKG" \
-              -type f -name alc 2>/dev/null | sort | tail -1)")
-          else
-            # Not a dotnet tool — download and extract the nupkg directly.
-            echo "Package is not a dotnet global tool; extracting nupkg"
-            EXTRACT_DIR="$HOME/.al-tool-cache/$AL_TOOL"
-            mkdir -p "$EXTRACT_DIR"
-            curl -fsSL \
-              "https://api.nuget.org/v3-flatcontainer/${PKG}/${AL_TOOL}/${PKG}.${AL_TOOL}.nupkg" \
-              -o "$EXTRACT_DIR/pkg.zip"
-            unzip -q -o "$EXTRACT_DIR/pkg.zip" -d "$EXTRACT_DIR"
-            rm "$EXTRACT_DIR/pkg.zip"
-            # Find alc wherever the package puts it. The TFM directory is
-            # NOT stable across AL majors: v17 ships lib/net8.0/alc, v18
-            # ships lib/net10.0/alc (and a lib/net8.0 that holds only the
-            # analyzer DLLs, so a directory test on net8.0 finds the wrong
-            # place and succeeds). Hardcoding net8.0 is what made the BC 29
-            # leg fail with exit 127 — "lib/net8.0/alc: No such file or
-            # directory" — after the compiler version itself resolved fine.
-            #
-            # Sorting picks the highest TFM when several carry an alc.
-            # No runtime install is needed either way: alc is self-contained,
-            # its runtimeconfig.json declares includedFrameworks rather than
-            # frameworks, so it bundles the .NET it needs. Verified for both
-            # v17 (net8.0) and v18 (net10.0).
-            ALC_PATH=$(find "$EXTRACT_DIR" -type f -name alc 2>/dev/null | sort | tail -1)
-            if [ -z "$ALC_PATH" ]; then
-              echo "::error::no 'alc' binary found in $PKG $AL_TOOL."
-              echo "Package contents (directories):"
-              find "$EXTRACT_DIR" -maxdepth 3 -type d | sed 's/^/  /'
-              exit 1
-            fi
-            AL_TOOL_DIR=$(dirname "$ALC_PATH")
-            echo "Found alc at $ALC_PATH"
-            chmod +x "$ALC_PATH" 2>/dev/null || true
-            # Create an AL wrapper so `AL compile ...` works in later steps.
-            # The v16 dotnet tool ships AL.dll which routes the `compile`
-            # subcommand; raw alc doesn't accept it — strip it here.
-            mkdir -p "$HOME/.al-bin"
-            printf '#!/bin/bash\n[ "$1" = compile ] && shift\nexec "%s/alc" "$@"\n' \
-              "$AL_TOOL_DIR" > "$HOME/.al-bin/AL"
-            chmod +x "$HOME/.al-bin/AL"
-            echo "$HOME/.al-bin" >> "$GITHUB_PATH"
-          fi
-
+          eval "$INSTALL_OUT"
+          echo "$AL_BIN_DIR" >> "$GITHUB_PATH"
           echo "AL_TOOL_DIR=$AL_TOOL_DIR" >> "$GITHUB_ENV"
           echo "AL compiler ready: $AL_TOOL_DIR"
           bash bc-linux/scripts/workflow-summary.sh end AL_INSTALL
@@ -809,7 +847,7 @@ jobs:
       #   - test_runner=auto on an older version → skip the install; the
       #     run step's live probe will route to the websocket runner
       - name: Install AL dotnet tool (altool test runner)
-        if: inputs.test_runner != 'websocket'
+        if: inputs.test_runner != 'websocket' && inputs.test_runner_codeunit_id == ''
         run: |
           set -e
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
@@ -850,13 +888,13 @@ jobs:
           # versions — the old glob-based staging silently failed
           # whenever an expected app moved (e.g. Tests-TestLibraries
           # under platform/applications/BaseApp/Test/ in BC 27.5).
-          ARGS=""
-          for d in $APP_DIRS $TEST_APP_DIRS; do
+          ARGS=()
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
-            [ -f "project/$d/app.json" ] && ARGS="$ARGS --app-json project/$d/app.json"
-          done
+            [ -f "project/$d/app.json" ] && ARGS+=(--app-json "project/$d/app.json")
+          done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
           python3 bc-linux/scripts/stage-symbols.py \
-            $ARGS \
+            "${ARGS[@]}" \
             --artifact-dir "$BC_ARTIFACTS_DIR" \
             --out-dir symbols \
             || true   # warnings about unresolved deps are non-fatal; AL compile gives the precise error if any
@@ -905,7 +943,7 @@ jobs:
           EFFECTIVE_RUNTIME="$RUNTIME_VERSION"
           BC_MAJOR=$(echo "${{ inputs.bc_version }}" | cut -d. -f1)
           if [ "$EFFECTIVE_RUNTIME" = "auto" ]; then
-            # Same BC-major-minus-11 rule as the compiler version; no network
+            # Same BC-to-AL major rule as the compiler version; no network
             # call needed for this one. The old table's fallback to 14.0 for
             # an unknown major was silently wrong for anything newer than 28.
             if ! EFFECTIVE_RUNTIME=$(python3 bc-linux/scripts/resolve-al-tool-version.py "${{ inputs.bc_version }}" --runtime); then
@@ -914,7 +952,7 @@ jobs:
             fi
           fi
           echo "Patching app.json runtime → $EFFECTIVE_RUNTIME"
-          for d in $APP_DIRS $TEST_APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             F="project/$d/app.json"
             [ -f "$F" ] || continue
@@ -929,7 +967,7 @@ jobs:
           else:
               print(f"  {p}: runtime already {sys.argv[2]}, skip")
           PYEOF
-          done
+          done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
 
       # Opt-in only. Mirrors AL-Go's own Update-AppJsonProperties (called
       # from Compile.ps1 before every Windows build) — a caller like AL-Go
@@ -949,7 +987,7 @@ jobs:
           REVISION_NUMBER: ${{ inputs.app_version_revision }}
         run: |
           echo "Patching app.json version: major.minor=${MAJOR_MINOR:-<unchanged>} build=${BUILD_NUMBER:-<unchanged>} revision=${REVISION_NUMBER:-<unchanged>}"
-          for d in $APP_DIRS $TEST_APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             F="project/$d/app.json"
             [ -f "$F" ] || continue
@@ -963,6 +1001,9 @@ jobs:
               parts.append("0")
           if major_minor:
               mm = major_minor.split(".")
+              if len(mm) != 2 or not all(mm):
+                  print(f"::error::app_version_major_minor must be 'MAJOR.MINOR' (e.g. '27.0'), got: {major_minor!r}")
+                  sys.exit(1)
               parts[0], parts[1] = mm[0], mm[1]
           if build and build != "0":
               parts[2] = build
@@ -976,7 +1017,7 @@ jobs:
           else:
               print(f"  {p}: version already {new_version}, skip")
           PYEOF
-          done
+          done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
 
       - name: Compile AL apps (no publish yet)
         env:
@@ -991,6 +1032,7 @@ jobs:
           ENABLE_EXTERNAL_RULESETS: ${{ inputs.enable_external_rulesets }}
           ENABLE_CODE_ANALYZERS_ON_TEST_APPS: ${{ inputs.enable_code_analyzers_on_test_apps }}
           PREPROCESSOR_SYMBOLS: ${{ inputs.preprocessor_symbols }}
+          ASSEMBLY_PROBING_PATHS: ${{ inputs.assembly_probing_paths }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin COMPILE "Compile AL apps"
@@ -1050,6 +1092,39 @@ jobs:
           PP_FLAG=()
           [ -n "$PREPROCESSOR_SYMBOLS" ] && PP_FLAG=("/define:$PREPROCESSOR_SYMBOLS")
 
+          # Resolve each probing-path entry to existing folders and join them
+          # with ';' into one flag. An entry that matches nothing fails here:
+          # the compiler would only report AL0451 for the assembly, with no
+          # hint that the folder was wrong.
+          if [ -n "$ASSEMBLY_PROBING_PATHS" ]; then
+            PROBE_DIRS=()
+            while IFS= read -r entry; do
+              entry="${entry%$'\r'}"
+              [ -z "${entry//[[:space:]]/}" ] && continue
+              case "$entry" in
+                /*) pattern="$entry" ;;
+                *)  pattern="$BC_ARTIFACTS_DIR/$entry" ;;
+              esac
+              # Unquoted so the glob expands; IFS= so the spaces in
+              # "Test Assemblies" and "Microsoft Dynamics NAV" do not split it.
+              matched=0
+              mapfile -t candidates < <(IFS=; shopt -s nullglob; m=($pattern); [ ${#m[@]} -gt 0 ] && printf '%s\n' "${m[@]}")
+              for dir in "${candidates[@]}"; do
+                [ -d "$dir" ] || continue
+                PROBE_DIRS+=("$dir")
+                matched=1
+              done
+              if [ "$matched" -eq 0 ]; then
+                echo "ERROR: assembly_probing_paths entry '$entry' matches no folder (looked for '$pattern')" >&2
+                exit 1
+              fi
+            done <<< "$ASSEMBLY_PROBING_PATHS"
+            PROBE_JOINED=$(IFS=';'; echo "${PROBE_DIRS[*]}")
+            PP_FLAG+=("/assemblyprobingpaths:$PROBE_JOINED")
+            echo "Assembly probing paths:"
+            printf '  %s\n' "${PROBE_DIRS[@]}"
+          fi
+
           compile_dir() {
             local src="$1"
             shift
@@ -1090,18 +1165,18 @@ jobs:
 
           # Compile production apps first so test apps can resolve them as deps.
           # Production apps always get the analyzer flags (when configured).
-          for d in $APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             mkdir -p "project/$d/.alpackages"
             cp build/*.app "project/$d/.alpackages/" 2>/dev/null || true
             compile_dir "project/$d" "${ANALYZER_FLAGS[@]}"
-          done
+          done <<< "$APP_DIRS"
 
           # Test apps get analyzer flags only when explicitly opted in via
           # enable_code_analyzers_on_test_apps. AL-Go's default is false
           # (analyzers don't run on test apps) and we mirror that so the
           # behavior matches what consumers see today.
-          for d in $TEST_APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             mkdir -p "project/$d/.alpackages"
             cp build/*.app "project/$d/.alpackages/" 2>/dev/null || true
@@ -1110,7 +1185,7 @@ jobs:
             else
               compile_dir "project/$d"
             fi
-          done
+          done <<< "$TEST_APP_DIRS"
 
           bash bc-linux/scripts/workflow-summary.sh end COMPILE
 
@@ -1130,16 +1205,16 @@ jobs:
         run: |
           set -e
           mkdir -p artifact-staging/Apps artifact-staging/TestApps
-          for d in $APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             f="build/$(basename "$d").app"
             [ -f "$f" ] && cp "$f" artifact-staging/Apps/
-          done
-          for d in $TEST_APP_DIRS; do
+          done <<< "$APP_DIRS"
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             f="build/$(basename "$d").app"
             [ -f "$f" ] && cp "$f" artifact-staging/TestApps/
-          done
+          done <<< "$TEST_APP_DIRS"
           echo "Staged files:"
           find artifact-staging -type f
 
@@ -1157,6 +1232,14 @@ jobs:
         run: |
           ./scripts/wait-for-bc-healthy.sh ${{ inputs.health_timeout_minutes }}
           bash scripts/workflow-summary.sh end BC_BOOT
+
+      # Opt-in (see verify_authentication input below). When enabled, this
+      # must run before the positive-only publish/smoke path: the former
+      # Patch #16b made every later step green even with a wrong password.
+      - name: Verify NavUserPassword authentication
+        if: ${{ inputs.verify_authentication }}
+        working-directory: bc-linux
+        run: ./scripts/test-authentication.sh
 
       # ─── Phase 7: publish compiled apps to the now-running BC ────────
       - name: Publish AL apps to BC
@@ -1200,14 +1283,14 @@ jobs:
               PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
             done
           fi
-          for d in $APP_DIRS $TEST_APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             app="build/$(basename "$d").app"
             [ -f "$app" ] || { echo "missing: $app"; exit 1; }
             echo ">>> Publishing $app"
             bc_publish_app "$app" "$DEV" "$AUTH" || exit 1
             PUBLISHED_COUNT=$((PUBLISHED_COUNT + 1))
-          done
+          done <<< "$APP_DIRS"$'\n'"$TEST_APP_DIRS"
           bash bc-linux/scripts/workflow-summary.sh count apps_published "$PUBLISHED_COUNT"
           # Track compile count too — same loop iteration shape, runs after compile.
           COMPILED_COUNT=$(ls build/*.app 2>/dev/null | wc -l)
@@ -1253,6 +1336,18 @@ jobs:
           # "altool" without server support fails inside the script with
           # a clear error instead of silently degrading.
           EFFECTIVE_RUNNER="${{ inputs.test_runner }}"
+          # A runner codeunit only exists on the websocket path; the hub runs
+          # tests without one (issue #193).
+          RUNNER_CODEUNIT_ARGS=()
+          if [ -n "${{ inputs.test_runner_codeunit_id }}" ]; then
+            RUNNER_CODEUNIT_ARGS=(--test-runner-codeunit "${{ inputs.test_runner_codeunit_id }}")
+            if [ "$EFFECTIVE_RUNNER" = "altool" ]; then
+              echo "ERROR: test_runner_codeunit_id needs the websocket runner; test_runner=altool runs tests without a runner codeunit"
+              exit 1
+            fi
+            EFFECTIVE_RUNNER="websocket"
+            echo "test_runner_codeunit_id=${{ inputs.test_runner_codeunit_id }}: using the websocket runner for every codeunit"
+          fi
           if [ "$EFFECTIVE_RUNNER" = "auto" ]; then
             if [ -x "$HOME/.dotnet/tools/al" ] \
                && python3 scripts/run-tests-altool.py --probe --port "$BC_DEV_PORT"; then
@@ -1273,7 +1368,7 @@ jobs:
           # the bc-linux working dir (= ./build/junit-* relative to the
           # consumer's repo root after the workflow finishes).
           mkdir -p ../build
-          for d in $TEST_APP_DIRS; do
+          while IFS= read -r d; do
             [ -z "$d" ] && continue
             app="../build/$(basename "$d").app"
             [ -f "$app" ] || { echo "skip: $app (not built)"; continue; }
@@ -1296,15 +1391,17 @@ jobs:
               python3 -u scripts/run-tests-hybrid.py \
                 --app "$app" \
                 --al-source-dir "../project/$d" \
+                --preprocessor-symbols "${{ inputs.preprocessor_symbols }}" \
                 --codeunit-range "${{ inputs.codeunit_range }}" \
                 --junit-output "$junit_file" \
                 --altool-cmd "$HOME/.dotnet/tools/al" \
+                --altool-transport "${{ inputs.altool_transport }}" \
                 --port "$BC_DEV_PORT" \
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
                 --api-port "$BC_API_PORT" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             elif [ "$EFFECTIVE_RUNNER" = "altool" ]; then
               # test_runner=altool (explicit force): EVERY codeunit through
               # the hub, no split — this is the "catch hub regressions"
@@ -1326,7 +1423,7 @@ jobs:
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --api-port "$BC_API_PORT" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             else
               ./scripts/run-tests.sh \
                 --app "$app" \
@@ -1335,7 +1432,8 @@ jobs:
                 --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
                 --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
                 "${COMPANY_ARGS[@]}" \
-                --timeout 30 2>&1 | tee "$tmplog"
+                "${RUNNER_CODEUNIT_ARGS[@]}" \
+                --timeout ${{ inputs.test_timeout_minutes }} 2>&1 | tee "$tmplog"
             fi
             RUN_TESTS_RC=${PIPESTATUS[0]}
             if [ "$RUN_TESTS_RC" -ne 0 ]; then
@@ -1358,7 +1456,7 @@ jobs:
               CODEUNITS_TOTAL=$((CODEUNITS_TOTAL + n))
             fi
             rm -f "$tmplog"
-          done
+          done <<< "$TEST_APP_DIRS"
           bash scripts/workflow-summary.sh count tests_total    "$TESTS_TOTAL"
           bash scripts/workflow-summary.sh count tests_passed   "$TESTS_PASSED"
           bash scripts/workflow-summary.sh count tests_failed   "$TESTS_FAILED"
@@ -1376,10 +1474,16 @@ jobs:
             exit 1
           fi
           if [ "$TESTS_TOTAL" -eq 0 ]; then
-            echo "ERROR: no tests ran (TESTS_TOTAL=0). Either the test app"
-            echo "       failed to install or the test framework didn't see"
-            echo "       any [Test] procedures."
-            exit 1
+            if [ -z "$TEST_APP_DIRS" ]; then
+              # No test apps were ever configured for this project - there was
+              # nothing to run, so zero is the correct result, not a failure.
+              echo "No test apps configured (test_app_dirs is empty) - nothing to test, skipping."
+            else
+              echo "ERROR: no tests ran (TESTS_TOTAL=0). Either the test app"
+              echo "       failed to install or the test framework didn't see"
+              echo "       any [Test] procedures."
+              exit 1
+            fi
           fi
 
       # Upload per-app JUnit XML as a workflow artifact even on test failure
@@ -1415,15 +1519,45 @@ jobs:
           BC_TELEMETRY_OPT_OUT: ${{ vars.BC_TELEMETRY_OPT_OUT || 'false' }}
         run: bash bc-linux/scripts/workflow-summary.sh emit
 
+      # `tail -500` is the whole diagnosis for anything that goes wrong at the
+      # END of a run and NO diagnosis at all for anything earlier. Measured on
+      # the four intermittent TestRunnerHub aborts of 2026-09-05: the failing
+      # `al runtests` ran ~4 minutes before the job ended, and the 500-line tail
+      # covered the final 1-2 SECONDS of the container log. The server-side
+      # exception behind every one of them was written, then thrown away here.
+      #
+      # So: keep the inline excerpt (cheap to read in the web UI), and write the
+      # WHOLE container log to a file that gets uploaded. Nothing about a
+      # failing run should depend on the failure having happened last.
       - name: BC logs (on failure)
         if: failure()
         working-directory: bc-linux
         run: |
+          mkdir -p ../bc-logs
+          docker compose logs --no-color bc > "../bc-logs/bc-${{ inputs.bc_version }}.log" 2>&1 || true
           echo "=== entrypoint.sh + selective filter output ==="
-          docker compose logs bc 2>&1 | grep -E "\[entrypoint\]|Selective|KEEP:|BC_CLEAR_ALL_APPS|BC_KEEP_APP_IDS|test framework|Library Assert|Microsoft_Any|Microsoft_Test Runner" || true
+          grep -E "\[entrypoint\]|\[StartupHook\]|Selective|KEEP:|BC_CLEAR_ALL_APPS|BC_KEEP_APP_IDS|test framework|Library Assert|Microsoft_Any|Microsoft_Test Runner" "../bc-logs/bc-${{ inputs.bc_version }}.log" || true
+          echo ""
+          echo "=== BC-EventLog entries, Development + Runtime categories (full run) ==="
+          # The hub lives in Category.Development; a session/company-open failure
+          # lands in Development or Runtime. Print every one with 40 lines of
+          # context so an exception and its stack arrive together, capped so a
+          # pathological run cannot blow the job log.
+          grep -n -A40 "Category: \(Development\|Runtime\)" "../bc-logs/bc-${{ inputs.bc_version }}.log" | head -2000 || true
           echo ""
           echo "=== last 500 lines of bc-1 ==="
-          docker compose logs bc 2>&1 | tail -500
+          tail -500 "../bc-logs/bc-${{ inputs.bc_version }}.log"
+          echo ""
+          echo "Full container log uploaded as artifact bc-container-log-${{ inputs.bc_version }} ($(wc -l < "../bc-logs/bc-${{ inputs.bc_version }}.log") lines)."
+
+      - name: Upload full BC container log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bc-container-log-${{ inputs.bc_version }}
+          path: bc-logs/
+          retention-days: 14
+          if-no-files-found: ignore
 
       # Last step in the job, and after the log dump above — the containers
       # have to still be ours while that runs. `if: always()` so a failed test

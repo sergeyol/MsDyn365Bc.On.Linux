@@ -11,7 +11,7 @@ name: BC test (prebuilt) [reusable]
 #   on: [push, pull_request, workflow_dispatch]
 #   jobs:
 #     test:
-#       uses: StefanMaron/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
+#       uses: aldevtools/MsDyn365Bc.On.Linux/.github/workflows/bc-test-prebuilt.yml@master
 #       with:
 #         bc_version:     "27.5"
 #         test_app_files: "tests/MyTests.app"
@@ -124,11 +124,43 @@ on:
             "50000..50100,130450,200000..210000" mixed
         required: true
         type: string
-      runner_image:
-        description: "Override the bc-runner image (defaults to the public ghcr.io tag)"
+      test_runner_codeunit_id:
+        description: >-
+          Run the test suite through this test runner codeunit, for example
+          130451 "Test Runner - Isol. Disabled" or a test app's own codeunit
+          with Subtype = TestRunner (BcContainerHelper's -testRunnerCodeunitId).
+          Blank (default) uses 130450 "Test Runner - Isol. Codeunit",
+          BcContainerHelper's default. Results come back in the same JUnit
+          format (issue #193).
         required: false
         type: string
-        default: "ghcr.io/stefanmaron/msdyn365bc.on.linux/bc-runner:latest"
+        default: ""
+      extra_apps:
+        description: >-
+          Newline-separated names of Microsoft apps from the BC artifact to
+          keep installed, together with their dependencies, although none of
+          your apps declares them (issue #125). The tier keeps only what your
+          apps need, so it can differ from a Windows container that has more
+          apps installed. Example: Tests-TestLibraries, whose codeunit 130011
+          "Backup Management" subscribes to GetDatabaseTableTriggerSetup and
+          so changes those results. A name that matches no app in the
+          artifact fails the job. Names are not case-sensitive. Each app that
+          is not already installed in the database costs a publish at boot:
+          Tests-TestLibraries ships no precompiled code and takes about 17s.
+          Empty (default) = no change.
+        required: false
+        type: string
+        default: ""
+      runner_image:
+        description: >-
+          Override the bc-runner image. Blank (default) uses the repository variable
+          IMAGE_NAMESPACE as ghcr.io/<IMAGE_NAMESPACE>/bc-runner:latest when it is set,
+          and otherwise docker-compose's own default. Passing the empty string through
+          is what makes the compose default apply: `${BC_RUNNER_IMAGE:-<default>}`
+          treats empty and unset alike.
+        required: false
+        type: string
+        default: ""
       test_company:
         description: >-
           Company to run the tests in. Blank (default) auto-detects: the
@@ -159,7 +191,7 @@ on:
         type: string
         default: ""
       bc_linux_ref:
-        description: "Git ref of StefanMaron/MsDyn365Bc.On.Linux to check out for scripts"
+        description: "Git ref of aldevtools/MsDyn365Bc.On.Linux to check out for scripts"
         required: false
         type: string
         default: "master"
@@ -187,7 +219,7 @@ jobs:
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
-      BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+      BC_RUNNER_IMAGE: ${{ inputs.runner_image || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
       # Blank passes through to docker-compose's `${BC_SQL_IMAGE:-<mirror>}`
       # default — `:-` treats empty and unset alike, so an unset input keeps
       # the mirror rather than resolving to an empty image name.
@@ -222,7 +254,7 @@ jobs:
       - name: Checkout MsDyn365Bc.On.Linux
         uses: actions/checkout@v4
         with:
-          repository: StefanMaron/MsDyn365Bc.On.Linux
+          repository: ${{ vars.BC_LINUX_REPOSITORY || 'aldevtools/MsDyn365Bc.On.Linux' }}
           ref: ${{ inputs.bc_linux_ref }}
           path: bc-linux
 
@@ -232,7 +264,7 @@ jobs:
       # Artifact download + docker pull in parallel (independent network IO).
       - name: Download BC artifacts + pull docker images (parallel)
         env:
-          BC_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          BC_RUNNER_IMAGE: ${{ inputs.runner_image || (vars.IMAGE_NAMESPACE && format('ghcr.io/{0}/bc-runner:latest', vars.IMAGE_NAMESPACE)) || '' }}
         run: |
           set -e
           bash bc-linux/scripts/workflow-summary.sh begin DOWNLOAD "Download BC artifacts + pull docker images"
@@ -261,6 +293,7 @@ jobs:
         env:
           APP_FILES: ${{ inputs.app_files }}
           TEST_APP_FILES: ${{ inputs.test_app_files }}
+          EXTRA_APPS: ${{ inputs.extra_apps }}
         run: |
           bash bc-linux/scripts/workflow-summary.sh begin RESOLVE "Resolve apps to keep"
           # Walk the consumer's .app files (not source dirs) AND bc-linux's
@@ -277,8 +310,17 @@ jobs:
               ARGS="$ARGS --app-file project/$f"
             fi
           done
+          # An array, because an app name can contain a space ("Data Archive").
+          EXTRA_ARGS=()
+          while IFS= read -r name; do
+            name="${name%$'\r'}"
+            if [ -n "${name//[[:space:]]/}" ]; then
+              EXTRA_ARGS+=(--extra-app-name "$name")
+            fi
+          done <<< "$EXTRA_APPS"
           KEEP_IDS=$(python3 bc-linux/scripts/resolve-keep-app-ids.py \
             $ARGS \
+            "${EXTRA_ARGS[@]}" \
             --artifact-dir "$BC_ARTIFACTS_DIR")
           echo "Resolved keep set: $KEEP_IDS"
           echo "BC_CLEAR_ALL_APPS=selective" >> "$GITHUB_ENV"
@@ -448,6 +490,10 @@ jobs:
           if [ -n "${TEST_COMPANY:-}" ]; then
             COMPANY_ARGS=(--company "$TEST_COMPANY")
           fi
+          RUNNER_CODEUNIT_ARGS=()
+          if [ -n "${{ inputs.test_runner_codeunit_id }}" ]; then
+            RUNNER_CODEUNIT_ARGS=(--test-runner-codeunit "${{ inputs.test_runner_codeunit_id }}")
+          fi
           # Per-app JUnit XML — see bc-test-from-source.yml for the rationale.
           mkdir -p ../build
           for app in $TEST_APP_FILES; do
@@ -463,6 +509,7 @@ jobs:
               --base-url "http://localhost:${BC_ODATA_PORT}/BC" \
               --dev-url "http://localhost:${BC_DEV_PORT}/BC/dev" \
               "${COMPANY_ARGS[@]}" \
+              "${RUNNER_CODEUNIT_ARGS[@]}" \
               --timeout 30 2>&1 | tee "$tmplog"
             # `tee` always exits 0; capture run-tests.sh's real exit code.
             RUN_TESTS_RC=${PIPESTATUS[0]}

@@ -46,6 +46,24 @@ class Program
             return PatchTestPageClient.Run(inputPath, outputPath);
         if (command == "types")
             return PatchNavTypes.Run(inputPath, outputPath);
+        if (command == "culture")
+            return PatchCulture.Run(inputPath, outputPath);
+        if (command == "uri")
+            return PatchHttpUri.Run(inputPath, outputPath);
+        if (command == "encoding")
+            return PatchEncoding.Run(inputPath, outputPath);
+        if (command == "newline")
+            return PatchNewline.Run(inputPath, outputPath);
+        if (command == "filelisting")
+            return PatchFileListing.Run(inputPath, outputPath);
+        if (command == "temppath")
+            return PatchTempPath.Run(inputPath, outputPath);
+        if (command == "testhttphandler")
+            return PatchTestHttpHandler.Run(inputPath, outputPath);
+        if (command == "windowslanguages")
+            return PatchWindowsLanguages.Run(inputPath, outputPath);
+        if (command == "filetable")
+            return PatchFileTable.Run(inputPath, outputPath);
 
         // Default: patch Nav.Ncl.dll
 

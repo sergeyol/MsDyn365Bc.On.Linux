@@ -7,6 +7,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Microsoft.AspNetCore.Server.HttpSys
@@ -123,6 +124,36 @@ namespace Microsoft.AspNetCore.Hosting
 
                 if (!string.IsNullOrEmpty(pathBase))
                     app.UsePathBase(pathBase);
+
+                // Behind a reverse proxy that rewrites Host (GitHub Codespaces sends
+                // "Host: localhost:<port>" and the browser-facing name only in
+                // X-Forwarded-Host), BC builds its redirects and resource links from the
+                // wrong host and scheme. BC_WEBCLIENT_TRUST_FORWARDED_HEADERS=1 applies
+                // X-Forwarded-Host / X-Forwarded-Proto before BC's own pipeline runs.
+                // Off by default: only turn it on when a proxy you control sets them.
+                if (Environment.GetEnvironmentVariable("BC_WEBCLIENT_TRUST_FORWARDED_HEADERS") == "1")
+                {
+                    app.Use(async (context, nextMiddleware) =>
+                    {
+                        var origHost = context.Request.Host.Value;
+                        var fwdHost = context.Request.Headers["X-Forwarded-Host"].ToString().Split(',')[0].Trim();
+                        if (fwdHost.Length > 0)
+                            context.Request.Host = new HostString(fwdHost);
+                        var fwdProto = context.Request.Headers["X-Forwarded-Proto"].ToString().Split(',')[0].Trim();
+                        if (fwdProto == "http" || fwdProto == "https")
+                            context.Request.Scheme = fwdProto;
+                        // The same proxy rewrites the host of Origin to match the rewritten Host
+                        // (Origin: http://localhost:<port> or https://localhost:<port>: it keeps
+                        // the browser's scheme, which differs between tunnel clusters). BC compares
+                        // Origin with the request's own origin on POSTs and WebSocket upgrades and
+                        // rejects a mismatch (400 / 403), so translate it the same way: when
+                        // Origin names the original host, whatever the scheme, replace it.
+                        if (Uri.TryCreate(context.Request.Headers["Origin"].ToString(), UriKind.Absolute, out var origin)
+                            && string.Equals(origin.Authority, origHost, StringComparison.OrdinalIgnoreCase))
+                            context.Request.Headers["Origin"] = $"{context.Request.Scheme}://{context.Request.Host.Value}";
+                        await nextMiddleware();
+                    });
+                }
 
                 // Set authenticated admin identity on every request.
                 // HTTPSYS_STUB_INJECT_IDENTITY=0 disables this for processes that

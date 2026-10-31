@@ -7,6 +7,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using BcLinux.Authentication;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using StreamJsonRpc;
@@ -14,12 +15,13 @@ using StreamJsonRpc;
 // BC Test Runner — connects via WebSocket client services to page 130455
 // (Command Line Test Tool) and runs tests using RunNextTest + TestResultJson.
 //
-// Mirrors BcContainerHelper's Run-TestsInBcContainer external behavior with
-// renewClientContextBetweenTests: reconnect BEFORE each RunNextTest call so
-// that BC's test-isolation session kill (which drops the WebSocket after each
-// codeunit) is never treated as an error.  BC tracks test-suite progress in
-// the Test Method Line table, so a fresh session always picks up where it
-// left off.
+// Mirrors BcContainerHelper's Run-TestsInBcContainer external behavior, INCLUDING
+// its RenewClientContextBetweenTests default of $false: one client session runs the
+// whole suite, and a new one is opened only when the old one is gone.  BC tracks
+// test-suite progress in the Test Method Line table, so a fresh session always picks
+// up where it left off — which is what makes a mid-run reconnect safe when it is
+// actually needed.  Pass --renew-client-context to reconnect before every codeunit
+// the way this runner used to unconditionally.
 //
 // Note: The DEFAULT test suite must be pre-created (via SQL in run-tests.sh).
 // The suite is opened by filtering TableView to Name=suiteName, which positions
@@ -38,6 +40,13 @@ var maxIterations = 500;
 var numCodeunitsOverride = 0; // explicit codeunit count for progress display
 var verbose = false;
 var junitOutput = ""; // path to write JUnit XML — empty = don't emit
+var authProbe = false; // authenticate through OpenConnection only; never open a company or run AL tests
+// Reconnect (new client session) before every RunNextTest. Default false, matching
+// BcContainerHelper's own RenewClientContextBetweenTests default — see the loop below
+// for why this is a fidelity setting and not just a performance one.
+var renewClientContextBetweenTests = false;
+var selfTestExitCode = false; // run ComputeExitCode's own assertions; no BC connection needed
+const int AuthenticationRejectedExitCode = 2;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -46,6 +55,7 @@ for (int i = 0; i < args.Length; i++)
     else if (args[i] == "--company" && i + 1 < args.Length) company = args[++i];
     else if (args[i] == "--user" && i + 1 < args.Length) user = args[++i];
     else if (args[i] == "--password" && i + 1 < args.Length) password = args[++i];
+    else if (args[i] == "--password-stdin") password = Console.In.ReadToEnd();
     else if (args[i] == "--timeout" && i + 1 < args.Length) timeoutMin = int.Parse(args[++i]);
     else if (args[i] == "--codeunit-timeout" && i + 1 < args.Length) codeunitTimeoutMin = int.Parse(args[++i]);
     else if (args[i] == "--suite" && i + 1 < args.Length) suiteName = args[++i];
@@ -54,6 +64,9 @@ for (int i = 0; i < args.Length; i++)
     else if (args[i] == "--num-codeunits" && i + 1 < args.Length) numCodeunitsOverride = int.Parse(args[++i]);
     else if (args[i] == "--verbose" || args[i] == "-v") verbose = true;
     else if (args[i] == "--junit-output" && i + 1 < args.Length) junitOutput = args[++i];
+    else if (args[i] == "--renew-client-context") renewClientContextBetweenTests = true;
+    else if (args[i] == "--auth-probe") authProbe = true;
+    else if (args[i] == "--self-test-exit-code") selfTestExitCode = true;
     else if (!args[i].StartsWith("--")) host = args[i];
 }
 
@@ -66,6 +79,9 @@ int odataResultsSeen = 0;
 // Cached across calls — avoid re-resolving company ID and recreating HttpClient
 HttpClient? cachedHttp = null;
 string? cachedCompanyId = null;
+// How many times OpenForm returned a JSON null and a reconnect recovered it (issue #56).
+// Printed at the end of the run, unconditionally, so the rate stays visible.
+int openFormNullRetries = 0;
 // Per-method result records, populated by PrintLiveResults as tests complete.
 // Used to emit JUnit XML at the end of the run when --junit-output is set.
 var recordedResults = new List<RecordedResult>();
@@ -74,9 +90,92 @@ var recordedResults = new List<RecordedResult>();
 void Log(string msg) { if (verbose) Console.Error.WriteLine(msg); }
 
 int exitCode = 1;
-try { exitCode = await RunTests(); }
+try { exitCode = selfTestExitCode ? SelfTestExitCode() : authProbe ? await RunAuthenticationProbe() : await RunTests(); }
 catch (Exception ex) { Console.Error.WriteLine($"FATAL: {ex.Message}"); }
 return exitCode;
+
+// ComputeExitCode is the ENTIRE contract between "did the run actually finish"
+// and the process exit code — see #57. Drive it directly rather than only
+// tracing it by eye: `dotnet run --project tools/TestRunner -- --self-test-exit-code`
+// needs no BC connection and exits non-zero if any case below disagrees with
+// the real function.
+static int ComputeExitCode(bool runCompleted, int codeunitsRun, int numCodeunits, int liveFailed, int livePassed)
+{
+    if (!runCompleted)
+    {
+        // liveFailed can be 0 here — that used to mean "return 0". An abandoned
+        // run must never look like a clean pass: the codeunits that never ran
+        // recorded neither a pass nor a fail, and "0 failed" said nothing about
+        // them either way.
+        Console.WriteLine($"ERROR: run did not complete — only {codeunitsRun} of {numCodeunits} codeunit(s) executed");
+        return 1;
+    }
+    return liveFailed > 0 ? 1 : (livePassed > 0 ? 0 : 1);
+}
+
+int SelfTestExitCode()
+{
+    var failures = new List<string>();
+    void Check(string label, bool cond)
+    {
+        Console.WriteLine((cond ? "  PASS  " : "  FAIL  ") + label);
+        if (!cond) failures.Add(label);
+    }
+
+    Console.WriteLine("ComputeExitCode:");
+
+    // The bug this closes: an abandoned run (runCompleted=false) with 0 live
+    // failures used to fall through to `livePassed > 0 ? 0 : 1` and return 0 —
+    // a leg reporting green with codeunits that never ran at all.
+    Check("abandoned run, 0 failed, some passed -> FAILS (was: 0)",
+          ComputeExitCode(runCompleted: false, codeunitsRun: 12, numCodeunits: 24, liveFailed: 0, livePassed: 40) == 1);
+    Check("abandoned run, 0 failed, 0 passed (died before anything ran) -> FAILS",
+          ComputeExitCode(runCompleted: false, codeunitsRun: 0, numCodeunits: 24, liveFailed: 0, livePassed: 0) == 1);
+    Check("abandoned run, some failed anyway -> still FAILS",
+          ComputeExitCode(runCompleted: false, codeunitsRun: 12, numCodeunits: 24, liveFailed: 1, livePassed: 30) == 1);
+
+    // Completed runs keep their original semantics — this must NOT regress.
+    Check("completed run, 0 failed, some passed -> PASSES",
+          ComputeExitCode(runCompleted: true, codeunitsRun: 24, numCodeunits: 24, liveFailed: 0, livePassed: 40) == 0);
+    Check("completed run, some failed -> FAILS",
+          ComputeExitCode(runCompleted: true, codeunitsRun: 24, numCodeunits: 24, liveFailed: 1, livePassed: 39) == 1);
+    Check("completed run, 0 total (nothing to run) -> FAILS",
+          ComputeExitCode(runCompleted: true, codeunitsRun: 0, numCodeunits: 0, liveFailed: 0, livePassed: 0) == 1);
+
+    if (failures.Count > 0)
+    {
+        Console.WriteLine($"\n{failures.Count} check(s) failed: {string.Join(", ", failures)}");
+        return 1;
+    }
+    Console.WriteLine("\nall checks passed");
+    return 0;
+}
+
+async Task<int> RunAuthenticationProbe()
+{
+    var authBytes = Encoding.UTF8.GetBytes($"{user}:{password}");
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+    var tokenCapture = new MetadataTokenCapture();
+    try
+    {
+        var (rpc, ws, sessionEndedCts) = await Connect(authBytes, tokenCapture, cts.Token);
+        using (sessionEndedCts)
+        using (rpc)
+        using (ws)
+        {
+            // OpenConnection in Connect is the authentication boundary. Do not
+            // open a country-specific company here: that would turn a valid
+            // login into a false authentication failure on non-W1 artifacts.
+            Console.WriteLine("WebSocket/client-services authentication: PASS");
+            return 0;
+        }
+    }
+    catch (RemoteInvocationException ex) when (IsAuthenticationRejection(ex))
+    {
+        Console.Error.WriteLine($"AUTH_REJECTED: {ex.Message}");
+        return AuthenticationRejectedExitCode;
+    }
+}
 
 async Task<int> RunTests()
 {
@@ -128,9 +227,9 @@ async Task<int> RunTests()
     }
 
     // Initial connection — used only for ClearTestResults before the loop.
-    var (rpc, ws, _) = await Connect(authBytes, tokenCapture, cts.Token);
-    var formState = await OpenTestPage(rpc, tokenCapture, company, cts.Token);
-    if (formState == null) return 1;
+    var initialSession = await OpenSessionWithRetry(authBytes, tokenCapture, company, cts.Token);
+    if (initialSession == null) return 1;
+    var (rpc, ws, _, formState) = initialSession.Value;
 
     // ClearTestResults once, before the loop.
     Log("Clearing previous results...");
@@ -142,59 +241,93 @@ async Task<int> RunTests()
     }
     catch (Exception ex) { Log($"Clear warning: {ex.Message[..Math.Min(80, ex.Message.Length)]}"); }
 
-    rpc.Dispose(); ws.Dispose();
-
-    // RunNextTest loop — reconnect BEFORE every call (mirrors BcContainerHelper's
-    // renewClientContextBetweenTests).  Each test-codeunit run will kill the BC
-    // session (test isolation), so ConnectionLostException is the normal outcome.
-    // BC tracks which codeunit to run next in the Test Method Line table, so a
-    // fresh session always advances to the next pending codeunit.
+    // RunNextTest loop.  The connection opened above is REUSED for the whole run
+    // unless --renew-client-context was passed.
+    //
+    // This used to reconnect before every call, on the stated grounds that BC kills
+    // the session after each codeunit under test isolation.  It does not:
+    // TestIsolation = Codeunit rolls back DATABASE changes after each test codeunit
+    // (see the property's own documentation) and says nothing about the client
+    // session, which is why the non-exception path below is reached at all.  The
+    // reconnect was voluntary, and it cost fidelity:
+    //
+    //   SingleInstance codeunit instances live for the lifetime of the SESSION, so a
+    //   fresh session per codeunit resets them.  Real BC — BcContainerHelper defaults
+    //   RenewClientContextBetweenTests to $false, so one client context runs the whole
+    //   suite — carries that state across test codeunits.  Measured on BC 28.4 with a
+    //   SingleInstance codeunit written by one test codeunit and read by the next:
+    //   reconnecting reads back the default, holding one session reads back the value.
+    //   See StefanMaron/MsDyn365Bc.On.Linux#65.
+    //
+    // A lost connection is still handled: haveSession goes false on any failure and
+    // the top of the loop opens a new session, so an aborted or server-dropped session
+    // recovers exactly the way the old code did on every iteration.
     var startTime = DateTime.UtcNow;
 
-    // Limit iterations to roughly 2x the number of codeunits (each codeunit = 1 run + 1 reconnect)
-    // plus extra buffer for the "All tests executed" detection.
+    // Upper bound on iterations. One codeunit per iteration is the normal case; the
+    // headroom covers iterations spent re-establishing a lost session, plus the extra
+    // pass the "All tests executed" detection can need.
     int numCodeunits = numCodeunitsOverride > 0 ? numCodeunitsOverride
         : !string.IsNullOrEmpty(codeunitFilter) ? codeunitFilter.Split(',').Length
         : 100;
-    // With test isolation (runner 130451), each codeunit kills the session.
-    // We need ~2 iterations per codeunit: one that runs + one empty reconnect.
     int effectiveMaxIterations = Math.Min(maxIterations, numCodeunits * 3 + 10);
 
     Log($"Running tests via WebSocket ({numCodeunits} codeunits, max {effectiveMaxIterations} iterations)...");
     int codeunitsRun = 0;
     printedCodeunits.Clear();
+    // Set true only when the loop breaks because BC confirmed there is no more
+    // work (allDone) or because we reached the codeunit count we were told to
+    // expect. Every other way out of this loop — a failed reconnect, a failed
+    // page-open, or running out of iterations — means the run was ABANDONED,
+    // not completed, and codeunitsRun < numCodeunits proves it: the caller
+    // (run-tests.sh) always passes --num-codeunits as the exact count it
+    // populated the suite with, so falling short of it here is never a
+    // legitimate outcome, only an unfinished one.
+    bool runCompleted = false;
+    // The session opened for ClearTestResults above is still live and is what the
+    // first iteration uses.  Set false whenever the session is gone (renewed, lost,
+    // or aborted by the watchdog) so the next iteration opens a new one.
+    bool haveSession = true;
     for (int iteration = 0; iteration < effectiveMaxIterations; iteration++)
     {
-        // Proactive reconnect before each RunNextTest.
-        CancellationTokenSource sessionEndedCts;
-        try
+        if (!haveSession)
         {
-            (rpc, ws, sessionEndedCts) = await Connect(authBytes, tokenCapture, cts.Token);
-            formState = await OpenTestPage(rpc, tokenCapture, company, cts.Token);
-            if (formState == null)
+            try
             {
-                Log("Could not open test page after reconnect");
+                var session = await OpenSessionWithRetry(authBytes, tokenCapture, company, cts.Token);
+                if (session == null)
+                {
+                    Log("Could not open test page after reconnect");
+                    break;
+                }
+                (rpc, ws, _, formState) = session.Value;
+                haveSession = true;
+            }
+            catch (Exception ex)
+            {
+                Log($"Reconnect failed: {ex.Message[..Math.Min(80, ex.Message.Length)]}");
                 break;
             }
-        }
-        catch (Exception ex)
-        {
-            Log($"Reconnect failed: {ex.Message[..Math.Min(80, ex.Message.Length)]}");
-            break;
         }
 
         string testResultJson = "";
         bool allDone = false;
+        // Cancelled as soon as this iteration finishes.  With one session spanning the
+        // whole run, an uncancelled watchdog from codeunit N would abort the connection
+        // in the middle of codeunit N+1.
+        var watchdogCts = new CancellationTokenSource();
         try
         {
             var capturedRpc = rpc;
             var capturedWs = ws;
-            _ = Task.Delay(TimeSpan.FromMinutes(codeunitTimeoutMin)).ContinueWith(_ =>
-            {
-                Log($"Watchdog: aborting hung connection after {codeunitTimeoutMin} min");
-                try { capturedWs.Abort(); } catch { }
-                try { capturedRpc.Dispose(); } catch { }
-            });
+            _ = Task.Delay(TimeSpan.FromMinutes(codeunitTimeoutMin), watchdogCts.Token)
+                .ContinueWith(t =>
+                {
+                    if (t.IsCanceled) return;
+                    Log($"Watchdog: aborting hung connection after {codeunitTimeoutMin} min");
+                    try { capturedWs.Abort(); } catch { }
+                    try { capturedRpc.Dispose(); } catch { }
+                }, TaskScheduler.Default);
 
             var result = await Invoke(rpc, formState, "RunNextTest", cts.Token);
             if (result?["DataSetState"] != null) formState = result["DataSetState"];
@@ -205,7 +338,7 @@ async Task<int> RunTests()
                 allDone = true;
             else
             {
-                // RunNextTest completed without killing the session (no test isolation on Linux).
+                // RunNextTest completed without killing the session — the normal path.
                 // Count the codeunit and fetch results normally.
                 codeunitsRun++;
                 await PrintLiveResults(authBytes, codeunitsRun, numCodeunits, startTime);
@@ -213,22 +346,47 @@ async Task<int> RunTests()
         }
         catch (Exception ex) when (ex is ConnectionLostException || ex is RemoteInvocationException || ex is OperationCanceledException)
         {
-            // Expected: BC killed the session after the codeunit finished (test isolation).
+            // The session died mid-codeunit (BC recycled it, or the watchdog aborted a
+            // hung one). The codeunit itself still ran, and its per-function results are
+            // in the Test Method Line table, so read them and open a fresh session next
+            // time round. Say why: a codeunit cut short shows up as SKIP rows with no
+            // other trace in the log (issue #125, codeunit 61202 on BC 27).
+            Console.Error.WriteLine($"[testrunner] session lost during codeunit {codeunitsRun + 1}: {ex.GetType().Name}: {ex.Message[..Math.Min(300, ex.Message.Length)]}");
+            haveSession = false;
             codeunitsRun++;
             // Print live per-function results for the codeunit that just completed
             await PrintLiveResults(authBytes, codeunitsRun, numCodeunits, startTime);
         }
+        finally
+        {
+            watchdogCts.Cancel();
+        }
 
-        try { rpc.Dispose(); ws.Dispose(); } catch { }
+        if (renewClientContextBetweenTests) haveSession = false;
+        if (!haveSession) { try { rpc.Dispose(); ws.Dispose(); } catch { } }
 
         if (allDone || codeunitsRun >= numCodeunits)
         {
+            runCompleted = true;
             if (allDone) Log("All tests executed (page confirmed)");
             else Log($"All {numCodeunits} codeunits executed — stopping");
             break;
         }
 
-        await Task.Delay(500, CancellationToken.None);
+        // Only worth pausing when the next iteration has to establish a new session —
+        // BC needs a moment after dropping one. On the reused-session path there is
+        // nothing to wait for, and 500ms per codeunit is real time on a long suite.
+        if (!haveSession) await Task.Delay(500, CancellationToken.None);
+    }
+
+    try { rpc.Dispose(); ws.Dispose(); } catch { }
+
+    if (!runCompleted)
+    {
+        Log($"WARN: run ended without completing — {codeunitsRun}/{numCodeunits} codeunit(s) executed. " +
+            "Stopped due to a reconnect/page-open failure or the iteration cap, not because BC " +
+            "reported the suite done. This is a session-establishment failure, not a test result — " +
+            "see https://github.com/StefanMaron/MsDyn365Bc.On.Linux/issues/57.");
     }
 
     // Print summary from live counts — no final OData read needed (saves ~3.5 minutes)
@@ -254,7 +412,9 @@ async Task<int> RunTests()
 
     Console.WriteLine($"\n=== Results ({elapsed.TotalSeconds:F0}s) ===");
     Console.WriteLine($"{total} total, {livePassed} passed, {liveFailed} failed, {liveSkipped} skipped");
-    return liveFailed > 0 ? 1 : (livePassed > 0 ? 0 : 1);
+    if (openFormNullRetries > 0)
+        Console.Error.WriteLine($"[testrunner] OpenForm returned a null result {openFormNullRetries} time(s) during this run; a reconnect recovered each one (see issue #56).");
+    return ComputeExitCode(runCompleted, codeunitsRun, numCodeunits, liveFailed, livePassed);
 }
 
 async Task PrintLiveResults(byte[] authBytes, int codeunitsRun, int numCodeunits, DateTime startTime)
@@ -411,23 +571,59 @@ async Task<JToken?> Invoke(JsonRpc rpc, JToken? formState, string action, Cancel
 
 async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> Connect(byte[] authBytes, MetadataTokenCapture tc, CancellationToken ct)
 {
+    var currentPassword = V3Password.GenerateInner(password);
+    try
+    {
+        return await ConnectOnce(authBytes, currentPassword, tc, ct);
+    }
+    catch (RemoteInvocationException ex) when (IsAuthenticationRejection(ex))
+    {
+        // BC 26 requires a second, legacy-password slot. Later versions accept
+        // the current V3 value directly. Negotiate from server behavior instead
+        // of relying on BC_VERSION, which is absent in host-side runner paths.
+        Log("Current V3 credential was rejected; retrying with the BC 26 legacy slot.");
+        return await ConnectOnce(authBytes, currentPassword + "|", tc, ct);
+    }
+}
+
+async Task<(JsonRpc, ClientWebSocket, CancellationTokenSource)> ConnectOnce(
+    byte[] authBytes, string clientServicesPassword, MetadataTokenCapture tc, CancellationToken ct)
+{
     Log($"Connecting to ws://{host}/ws/connect");
     var sessionEndedCts = new CancellationTokenSource();
     var ws = new ClientWebSocket();
-    ws.Options.SetRequestHeader("Authorization", $"Basic {Convert.ToBase64String(authBytes)}");
-    await ws.ConnectAsync(new Uri($"ws://{host}/ws/connect"), ct);
-    var rpc = new JsonRpc(new WebSocketMessageHandler(ws));
-    rpc.TraceSource.Switch.Level = System.Diagnostics.SourceLevels.Verbose;
-    rpc.TraceSource.Listeners.Add(tc);
-    var callbacks = new Callbacks(sessionEndedCts);
-    rpc.AddLocalRpcTarget(callbacks);
-    callbacks.Rpc = rpc;
-    rpc.StartListening();
-    await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection",
-        new object[] { new { LCID = 1033, DefaultLCID = 1033, TimeZoneId = "UTC", Credentials = new { UserName = user, Password = password } } }, ct);
-    Log("Connected.");
-    return (rpc, ws, sessionEndedCts);
+    JsonRpc? rpc = null;
+    try
+    {
+        ws.Options.SetRequestHeader("Authorization", $"Basic {Convert.ToBase64String(authBytes)}");
+        await ws.ConnectAsync(new Uri($"ws://{host}/ws/connect"), ct);
+        rpc = new JsonRpc(new WebSocketMessageHandler(ws));
+        rpc.TraceSource.Switch.Level = System.Diagnostics.SourceLevels.Verbose;
+        rpc.TraceSource.Listeners.Add(tc);
+        var callbacks = new Callbacks(sessionEndedCts) { DownloadBaseUrl = $"http://{host}/", AuthBytes = authBytes };
+        rpc.AddLocalRpcTarget(callbacks);
+        callbacks.Rpc = rpc;
+        rpc.StartListening();
+        // The result is the session's UserSettings; its TenantId and ServerExternalSessionId
+        // are what the client-services HTTP endpoints identify the session by.
+        var userSettings = await rpc.InvokeWithCancellationAsync<JToken>("OpenConnection",
+            new object[] { new { LCID = 1033, DefaultLCID = 1033, TimeZoneId = "UTC", ClientConnectionType = 115, Credentials = new { UserName = user, Password = clientServicesPassword } } }, ct);
+        callbacks.TenantId = userSettings?["TenantId"]?.ToString();
+        callbacks.ServerExternalSessionId = userSettings?["ServerExternalSessionId"]?.ToString();
+        Log("Connected.");
+        return (rpc, ws, sessionEndedCts);
+    }
+    catch
+    {
+        rpc?.Dispose();
+        ws.Dispose();
+        sessionEndedCts.Dispose();
+        throw;
+    }
 }
+
+static bool IsAuthenticationRejection(Exception ex) =>
+    ex.Message.Contains("rejected the client credentials", StringComparison.OrdinalIgnoreCase);
 
 async Task<JToken?> OpenTestPage(JsonRpc rpc, MetadataTokenCapture tc, string company, CancellationToken ct)
 {
@@ -447,10 +643,48 @@ async Task<JToken?> OpenTestPage(JsonRpc rpc, MetadataTokenCapture tc, string co
     return state;
 }
 
+// Opens a fresh WebSocket connection and the test page on it, retrying with a brand
+// new connection when OpenForm comes back null (issue #56). OpenForm returning a JSON
+// null is a JSON-RPC success whose result is null — it never throws, so the caller had
+// no exception to catch and, before this, nothing to retry either. A null result can mean
+// the connection itself is in a bad state, so each attempt opens its own connection
+// rather than retrying OpenForm on the one that just failed.
+//
+// This only retries a null OpenForm result. If Connect() itself throws (the WebSocket
+// handshake or OpenConnection call fails), that exception propagates immediately —
+// no attempts are consumed retrying it. That matches issue #56's scope, which is about
+// the null result specifically; a throwing Connect() is unrelated and already surfaces
+// as an exception the caller can see.
+async Task<(JsonRpc rpc, ClientWebSocket ws, CancellationTokenSource sessionEndedCts, JToken formState)?> OpenSessionWithRetry(
+    byte[] authBytes, MetadataTokenCapture tc, string company, CancellationToken ct, int maxAttempts = 3)
+{
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
+    {
+        var (rpc, ws, sessionEndedCts) = await Connect(authBytes, tc, ct);
+        var formState = await OpenTestPage(rpc, tc, company, ct);
+        // The returned session's sessionEndedCts is owned by the caller from here,
+        // same as it always was at the two call sites this replaces — only a
+        // discarded (failed) attempt's CTS is disposed below.
+        if (formState != null) return (rpc, ws, sessionEndedCts, formState);
+
+        openFormNullRetries++;
+        Log($"OpenForm returned null on attempt {attempt}/{maxAttempts}; reconnecting.");
+        try { rpc.Dispose(); } catch { }
+        try { ws.Dispose(); } catch { }
+        try { sessionEndedCts.Dispose(); } catch { }
+        if (attempt < maxAttempts) await Task.Delay(TimeSpan.FromSeconds(2), ct);
+    }
+    return null;
+}
+
 class Callbacks
 {
     private readonly CancellationTokenSource _sessionEndedCts;
     public JsonRpc? Rpc { get; set; }
+    public string DownloadBaseUrl { get; set; } = "";
+    public byte[] AuthBytes { get; set; } = Array.Empty<byte>();
+    public string? TenantId { get; set; }
+    public string? ServerExternalSessionId { get; set; }
 
     public Callbacks(CancellationTokenSource sessionEndedCts) => _sessionEndedCts = sessionEndedCts;
 
@@ -480,7 +714,19 @@ class Callbacks
     [JsonRpcMethod("OnSessionTerminating")]
     public Task OnSessionTerminating() { _sessionEndedCts.Cancel(); return Task.CompletedTask; }
 
-    [JsonRpcMethod("Confirm")] public async Task Confirm(JToken r) => await AckCallback("Confirm");
+    // A Confirm that reaches the client (no handler took it, e.g. the "Your change might
+    // update related records" question when a TestPage renames its record) is answered with
+    // the request's default, as the hub's TestRunnerClientCallback does. NSClientCallback
+    // unboxes the result to bool, so the generic null ack was a NullReferenceException in AL,
+    // and on BC 27 it ended the session (issue #122). The Result goes through BC's
+    // ObjectWithTypeInfoConverter: {typeHint, value}, with 19 = JsonTypeHint.Bool.
+    [JsonRpcMethod("Confirm")] public async Task Confirm(JToken r)
+    {
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        bool defaultValue = request?["DefaultValue"]?.Type == JTokenType.Boolean && request["DefaultValue"]!.Value<bool>();
+        if (Rpc != null)
+            try { await Rpc.InvokeAsync("EndClientCall", new object?[] { new JObject { ["Result"] = new JObject { ["typeHint"] = 19, ["value"] = defaultValue } } }); } catch { }
+    }
     [JsonRpcMethod("ProcessServerRequests")] public async Task ProcessServerRequests(JToken r) => await AckCallback("ProcessServerRequests");
     [JsonRpcMethod("FormRunModal")] public async Task FormRunModal(JToken r) => await AckCallback("FormRunModal");
     [JsonRpcMethod("FormClose")] public async Task FormClose(JToken r) => await AckCallback("FormClose");
@@ -492,16 +738,231 @@ class Callbacks
         if (Rpc != null)
             try { await Rpc.InvokeAsync("EndClientCall", new object?[] { 1 }); } catch { }
     }
-    [JsonRpcMethod("FileActionDialog")] public async Task FileActionDialog(JToken r) => await AckCallback("FileActionDialog");
+    [JsonRpcMethod("FileActionDialog")] public async Task FileActionDialog(JToken r)
+    {
+        // Answer the way the client of a Windows container's test run does (issue #122).
+        // That client is the web server's client-services session, whose file dialog
+        // provider hands a download to the caller as a link and refuses an upload. So
+        // File.Download / DownloadFromStream return true and leave ToFile as it was, and
+        // Database.ImportData / DataFileInformation raise NotSupportedFileDialogProvider.
+        // The generic ack below answers with a null result, which NSClientCallback casts
+        // to FileActionResponse and dereferences: a NullReferenceException in AL.
+        var action = FileActionOf(r);
+        if (Rpc != null && action == FileActionDownload)
+        {
+            await DrainDownloadStream();
+            var response = new JObject { ["FileActionRequest"] = r.DeepClone(), ["IsFileAccessed"] = true };
+            try { await Rpc.InvokeAsync("EndClientFileActionCall", new object?[] { response }); } catch { }
+            return;
+        }
+        if (Rpc != null && action == FileActionUpload)
+        {
+            try { await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(NotSupportedFileDialogType, NotSupportedFileDialogMessage), NotSupportedFileDialogMessage }); } catch { }
+            return;
+        }
+        await AckCallback("FileActionDialog");
+    }
+
+    // A download hands the client a stream (Connection.DownloadStream) that it fetches from
+    // uploadDownload/download, as Microsoft's UploadDownloadClient does (it adds the instance
+    // and a client/ prefix; both routes reach the same controller). For a file that
+    // is only bookkeeping, but Database.ExportData writes its export on a background thread into
+    // a pipe that blocks until someone reads it: accepting the download without reading made
+    // every ExportData wait for the pipe's 60-second timeout and fail with an uncatchable
+    // TimeoutException (issue #125). The bytes are discarded; the test client has no file system
+    // the AL code could look at, which is also why ToFile stays as it was.
+    private async Task DrainDownloadStream()
+    {
+        if (string.IsNullOrEmpty(ServerExternalSessionId)) return;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, DownloadBaseUrl + "uploadDownload/download");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(AuthBytes));
+            request.Headers.Add("server-tenant-id", TenantId ?? "default");
+            request.Headers.Add("server-session-id", ServerExternalSessionId);
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"[testrunner] download stream: HTTP {(int)response.StatusCode}");
+                return;
+            }
+            await using var body = await response.Content.ReadAsStreamAsync();
+            await body.CopyToAsync(System.IO.Stream.Null);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[testrunner] download stream: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // Microsoft.Dynamics.Nav.Types.FileAction
+    private const int FileActionUpload = 1;
+    private const int FileActionDownload = 2;
+
+    private static int FileActionOf(JToken r)
+    {
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var action = request?["Action"];
+        if (action == null) return -1;
+        if (action.Type == JTokenType.Integer) return action.Value<int>();
+        return action.ToString() switch { "Upload" => FileActionUpload, "Download" => FileActionDownload, _ => -1 };
+    }
+
+    // Lang.NavFileOperationsNotSupported, the message of NavNotSupportedFileDialogProviderException.
+    private const string NotSupportedFileDialogMessage =
+        "The operation cannot complete because it uses a feature that is not supported (AL File function.)";
+
+    private const string NotSupportedFileDialogType = "Microsoft.Dynamics.Nav.Types.Exceptions.NavNotSupportedFileDialogProviderException";
+
+    // A ServerFault carrying a Microsoft.Dynamics.Nav.Types exception, in the form
+    // ExceptionHandler.DeserializeFromByteArray reads: base64 of a JSON array of exceptions,
+    // each serialized through ISerializable with its $type. The server rethrows it as the
+    // original exception, so AL sees the same text and error code as on Windows.
+    private static JObject ClientFault(string typeName, string message)
+    {
+        var exception = new JObject
+        {
+            ["$type"] = typeName + ", Microsoft.Dynamics.Nav.Types",
+            ["SuppressMessage"] = false,
+            ["FatalityScope"] = 0,
+            ["errorLevel"] = 0,
+            ["DiagnosticsSuppress"] = false,
+            ["DiagnosticsMessage"] = null,
+            ["TransientDiagnosticsMessage"] = null,
+            ["SuppressExceptionCreatedEvent"] = false,
+            ["ALCallStack"] = null,
+            ["detailedErrorMessage"] = null,
+            ["EnglishLanguageDiagnosticsMessage"] = null,
+            ["UntrappableError"] = false,
+            ["ClassName"] = typeName,
+            ["Message"] = message,
+            ["Data"] = null,
+            ["InnerException"] = null,
+            ["HelpURL"] = null,
+            ["StackTraceString"] = null,
+            ["RemoteStackTraceString"] = null,
+            ["RemoteStackIndex"] = 0,
+            ["ExceptionMethod"] = null,
+            ["HResult"] = -2146233067,
+            ["Source"] = null,
+            ["WatsonBuckets"] = null,
+        };
+        var data = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(new JArray(exception).ToString(Newtonsoft.Json.Formatting.None)));
+        return new JObject { ["exceptionData"] = data, ["responseQueue"] = null };
+    }
     [JsonRpcMethod("FeedbackRequested")] public async Task FeedbackRequested(JToken r) => await AckCallback("FeedbackRequested");
-    [JsonRpcMethod("CreateDotNetHandle")] public async Task CreateDotNetHandle(JToken r) => await AckCallback("CreateDotNetHandle");
-    [JsonRpcMethod("GetDotNetObject")] public async Task GetDotNetObject(JToken r) => await AckCallback("GetDotNetObject");
+    // RunOnClient DotNet, answered the way the client of a Windows container's test run does
+    // (issue #125). That client is the web server's client-services session, whose
+    // ObservingAutomationHandler (Microsoft.Dynamics.Nav.Client.WebCommon) hands out a handle
+    // for a known client extension type when no instance is asked for, answers the static
+    // IsAvailable on it with whether the session supports the extension - which a session with
+    // no browser does not - and refuses everything else with NavDotNetFromAlNotSupportedException.
+    // So "if UserTours.IsAvailable() then" is false and the page opens, as on Windows. The
+    // generic null ack made NSClientCallback dereference a null AutomationMethodResponse: a
+    // NullReferenceException in AL, e.g. from "O365 Activities" OnInit when a TestPage opens
+    // the Business Manager Role Center, and on BC 27 the end of the session.
+    [JsonRpcMethod("CreateDotNetHandle")] public async Task CreateDotNetHandle(JToken r)
+    {
+        if (Rpc == null) return;
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var typeName = Field(request, "TypeName")?.ToString() ?? "";
+        var varName = Field(request, "VarName")?.ToString();
+        bool createInstance = Field(request, "CreateInstance")?.Type == JTokenType.Boolean && Field(request, "CreateInstance")!.Value<bool>();
+        try
+        {
+            if (Array.IndexOf(ClientExtensionTypes, typeName) >= 0 && !createInstance && string.IsNullOrEmpty(varName))
+            {
+                int handle = Interlocked.Increment(ref _nextExtensionHandle);
+                var returnValue = new JObject { ["typeHint"] = 17, ["value"] = new JObject { ["handle"] = handle, ["isComObject"] = false } };
+                await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { AutomationResponse(returnValue, request) });
+                return;
+            }
+            await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(DotNetFromAlNotSupportedType, DotNetFromAlNotSupportedMessage), DotNetFromAlNotSupportedMessage });
+        }
+        catch { /* connection may be closing */ }
+    }
+
+    // ObservingAutomationHandler.AllClientExtentionsTypes, BC 28.5.
+    private static readonly string[] ClientExtensionTypes =
+    {
+        "Microsoft.Dynamics.Nav.Client.Capabilities.LocationProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.CameraBarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.BarcodeScannerProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.DeviceContactProvider",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Tour",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.UserTours",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.AppSource",
+        "Microsoft.Dynamics.Nav.Client.PageNotifier",
+        "Microsoft.Dynamics.Nav.Client.Hosts.OfficeHost",
+        "Microsoft.Dynamics.Nav.Client.Capabilities.Designer",
+    };
+
+    private int _nextExtensionHandle = 1000;
+
+    // InvokeAutomationMethod on a handle from CreateDotNetHandle above (every other
+    // CreateDotNetHandle is refused, so no other handle exists). Static IsAvailable is false
+    // and #IsNull is false, as the web client answers for an extension object. Anything else
+    // (Create, a method of an instance) fails: the web client raises NavNCLDotNetCreateException
+    // there, whose message this runner does not have, so it refuses with the same
+    // NavDotNetFromAlNotSupportedException as above. A test only gets here by ignoring
+    // IsAvailable.
+    [JsonRpcMethod("InvokeAutomationMethod")] public async Task InvokeAutomationMethod(JToken r)
+    {
+        if (Rpc == null) return;
+        var request = r.Type == JTokenType.Array ? r.First : r;
+        var methodName = Field(request, "MethodName")?.ToString() ?? "";
+        try
+        {
+            if (methodName == "IsAvailable" || methodName == "#IsNull")
+            {
+                var returnValue = new JObject { ["typeHint"] = 19, ["value"] = false };
+                await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { AutomationResponse(returnValue, request) });
+                return;
+            }
+            await Rpc.InvokeAsync("SendClientException", new object?[] { ClientFault(DotNetFromAlNotSupportedType, DotNetFromAlNotSupportedMessage), DotNetFromAlNotSupportedMessage });
+        }
+        catch { /* connection may be closing */ }
+    }
+
+    // Microsoft.Dynamics.Nav.Types.AutomationMethodResponse, by its [DataMember] field names.
+    // The server copies "arguments" back into the caller's by index, so they are echoed.
+    private static JObject AutomationResponse(JObject returnValue, JToken? request) => new()
+    {
+        ["returnValue"] = returnValue,
+        ["arguments"] = Field(request, "Arguments")?.DeepClone() ?? new JArray(),
+    };
+
+    private static JToken? Field(JToken? obj, string name) =>
+        (obj as JObject)?.GetValue(name, StringComparison.OrdinalIgnoreCase);
+
+    private const string DotNetFromAlNotSupportedType = "Microsoft.Dynamics.Nav.Types.Exceptions.NavDotNetFromAlNotSupportedException";
+    // Lang.NavDotNetFromAlNotSupportedException, the message of NavDotNetFromAlNotSupportedException.
+    private const string DotNetFromAlNotSupportedMessage =
+        "The operation cannot complete because it uses a feature that is not supported (.NET Framework Interoperability.)";
+    // A control add-in's instance, asked for when AL calls a procedure of a usercontrol
+    // (CurrPage.Ctl.Say(...)). A TestPage has no client form, so no add-in was ever created.
+    // The web client answers with an AutomationMethodResponse whose ReturnValue is null
+    // (ServiceClientCallback.OnGetDotNetObject, AutomationHandlerBase.GetDotNetObjectCore), and
+    // NavDotNet.CheckClientControlAddIn then raises "The control add-in on control X on page Y
+    // has not been instantiated." (DotNetControlAddInNotCreated), as on Windows. The generic
+    // null ack made NSClientCallback dereference a null response instead: a
+    // NullReferenceException, reported as "A call to Say failed" (issue #133).
+    [JsonRpcMethod("GetDotNetObject")] public async Task GetDotNetObject(JToken r)
+    {
+        if (Rpc == null) return;
+        var returnValue = new JObject { ["typeHint"] = 25, ["value"] = null }; // JsonTypeHint.Null
+        try { await Rpc.InvokeAsync("EndClientAutomationMethodCall", new object?[] { new JObject { ["returnValue"] = returnValue, ["arguments"] = new JArray() } }); }
+        catch { /* connection may be closing */ }
+    }
     // Dialog callbacks — BC sends these when AL code opens/closes dialogs
     [JsonRpcMethod("CloseDialog")] public async Task CloseDialog(JToken r) => await AckCallback("CloseDialog");
     [JsonRpcMethod("OpenDialog")] public async Task OpenDialog(JToken r) => await AckCallback("OpenDialog");
     [JsonRpcMethod("UpdateDialog")] public async Task UpdateDialog(JToken r) => await AckCallback("UpdateDialog");
-    [JsonRpcMethod("DisposeAutomationObject")] public Task DisposeAutomationObject(JToken r) => Task.CompletedTask;
-    [JsonRpcMethod("InvokeAutomationMethod")] public Task InvokeAutomationMethod(JToken r) => Task.CompletedTask;
+    // BC waits for this one (GetClientReturnValue: DisposeAutomationObject), so it needs the
+    // EndClientCall too. Before CreateDotNetHandle handed out handles it was never reached.
+    [JsonRpcMethod("DisposeAutomationObject")] public async Task DisposeAutomationObject(JToken r) => await AckCallback("DisposeAutomationObject");
     [JsonRpcMethod("DataSetPageReady")] public Task DataSetPageReady(JToken r) => Task.CompletedTask;
     [JsonRpcMethod("OpenProgressDialog")] public Task OpenProgressDialog(JToken r) => Task.CompletedTask;
     [JsonRpcMethod("CloseProgressDialog")] public Task CloseProgressDialog() => Task.CompletedTask;
